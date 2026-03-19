@@ -11,6 +11,7 @@ st.title("🎯 EUR/USD 流動性清掃狙擊策略 (M15 Sweep + M1 Entry)")
 
 with st.expander("📖 策略邏輯與圖表說明"):
     st.markdown("""
+    * **時間顯示**：所有時間已自動轉換為 **台灣時間 (UTC+8)**。
     * **流動性清掃 (Liquidity Sweep)**：尋找過去 20 根 15分鐘K線的前高或前低。
     * **假突破 (Fakeout)**：當前 M15 K線刺穿前高/前低，但收盤卻收在區間內（留下長引線）。
     * **精準入場 (Sniper Entry)**：切換至 1分鐘圖，當 M1 價格反向突破 M15 的開盤價時立刻進場。
@@ -39,12 +40,26 @@ def load_yf_data():
     
     m1_data.dropna(inplace=True)
     m15_data.dropna(inplace=True)
+
+    # 🕒 轉換為台灣時間 (Asia/Taipei)
+    if m1_data.index.tz is not None:
+        m1_data.index = m1_data.index.tz_convert('Asia/Taipei').tz_localize(None)
+    if m15_data.index.tz is not None:
+        m15_data.index = m15_data.index.tz_convert('Asia/Taipei').tz_localize(None)
+
     return m1_data, m15_data
 
 @st.cache_data
 def process_csv_data(df):
     df['Datetime'] = pd.to_datetime(df['Datetime'])
     df.set_index('Datetime', inplace=True)
+    
+    # 🕒 假設 CSV 是 UTC 時間，將其轉換為台灣時間
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei').tz_localize(None)
+    else:
+        df.index = df.index.tz_convert('Asia/Taipei').tz_localize(None)
+
     m1_data = df
     m15_data = m1_data.resample('15min').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'})
     m15_data.dropna(inplace=True)
@@ -55,7 +70,7 @@ m1_data, m15_data = None, None
 if data_source == "Yahoo Finance (限制最近7天)":
     m1_data, m15_data = load_yf_data()
 else:
-    uploaded_file = st.sidebar.file_uploader("上傳 1分鐘 K線 CSV", type="csv")
+    uploaded_file = st.sidebar.file_uploader("上傳 1分鐘 K線 CSV (預設時間為UTC)", type="csv")
     if uploaded_file is not None:
         raw_df = pd.read_csv(uploaded_file)
         m1_data, m15_data = process_csv_data(raw_df)
@@ -155,7 +170,7 @@ if m1_data is not None and m15_data is not None:
     if trades_df.empty:
         st.warning("在此時間段內未觸發任何符合此嚴格策略的交易訊號。")
     else:
-        st.subheader("📊 交易紀錄與回測結果")
+        st.subheader("📊 交易紀錄與回測結果 (台灣時間)")
         
         total_trades = len(trades_df)
         wins = len(trades_df[trades_df['Outcome'] == 'TP Hit'])
@@ -181,11 +196,9 @@ if m1_data is not None and m15_data is not None:
         selected_idx = trade_options.index(selected_trade_str)
         trade = trades_df.iloc[selected_idx]
         
-        # 繪圖區間：為配合 15 分鐘圖，前後多抓幾個小時確保 K 線數量足夠
         start_plot = trade['Swept Time'] - timedelta(minutes=120)
         end_plot = trade['Exit Time'] + timedelta(minutes=180) if pd.notna(trade['Exit Time']) else trade['Entry Time'] + timedelta(minutes=240)
         
-        # 🌟 修改核心：繪圖資料源改用 m15_data
         plot_m15 = m15_data[(m15_data.index >= start_plot) & (m15_data.index <= end_plot)]
         
         fig = go.Figure(data=[go.Candlestick(x=plot_m15.index,
@@ -193,32 +206,26 @@ if m1_data is not None and m15_data is not None:
                         low=plot_m15['Low'], close=plot_m15['Close'],
                         name="15M K線", increasing_line_color='lightgray', decreasing_line_color='gray')])
         
-        # 1. 繪製前高/前低的水平虛線 (Liquidity Line)
         fig.add_shape(type="line", x0=trade['Swept Time'], y0=trade['Swept Level'], x1=end_plot, y1=trade['Swept Level'],
                       line=dict(color="rgba(200, 200, 200, 0.6)", width=1, dash="dot"))
         fig.add_annotation(x=trade['Swept Time'], y=trade['Swept Level'], text="Prev M15 H/L", showarrow=False, yshift=10, font=dict(color="white"))
 
-        # 2. 繪製清掃標記 (半透明圓圈，放在假突破的 M15 蠟燭中心)
         circle_color = "rgba(255, 50, 50, 0.4)" if trade['Type'] == 'Short' else "rgba(50, 255, 50, 0.4)"
         fig.add_trace(go.Scatter(
-            x=[trade['Fakeout Time'] + timedelta(minutes=7.5)], # 調整到15分K棒中間
+            x=[trade['Fakeout Time'] + timedelta(minutes=7.5)], 
             y=[trade['Swept Level']],
             mode='markers', marker=dict(size=25, color=circle_color, line=dict(width=0)),
             name='Liquidity Sweep (清掃)'
         ))
 
-        # 3. 繪製 SMC 風格進出場區間色塊 (Risk & Reward Zones)
         exit_time_plot = trade['Exit Time'] if pd.notna(trade['Exit Time']) else end_plot
         
-        # 紅色止損區間 (Risk)
         fig.add_shape(type="rect", x0=trade['Entry Time'], y0=trade['Entry Price'], x1=exit_time_plot, y1=trade['SL'],
                       fillcolor="rgba(255, 0, 0, 0.15)", line_width=0, layer="below")
         
-        # 藍綠色止盈區間 (Reward)
         fig.add_shape(type="rect", x0=trade['Entry Time'], y0=trade['Entry Price'], x1=exit_time_plot, y1=trade['TP'],
                       fillcolor="rgba(0, 150, 255, 0.15)", line_width=0, layer="below")
 
-        # 4. 標示 1分鐘 級別的精準進場點 (掛在 M15 圖表上)
         fig.add_trace(go.Scatter(
             x=[trade['Entry Time']], y=[trade['Entry Price']],
             mode='markers+text', marker=dict(size=10, symbol='triangle-right', color='white'),
@@ -226,13 +233,12 @@ if m1_data is not None and m15_data is not None:
         ))
         
         fig.update_layout(
-            title=f"復盤: {trade['Type']} 交易於 {trade['Entry Time'].strftime('%m-%d %H:%M')}",
-            yaxis_title='價格', xaxis_title='時間',
+            title=f"復盤: {trade['Type']} 交易於 {trade['Entry Time'].strftime('%m-%d %H:%M')} (台灣時間)",
+            yaxis_title='價格', xaxis_title='台灣時間 (UTC+8)',
             template='plotly_dark', xaxis_rangeslider_visible=False, height=650,
-            plot_bgcolor='#131722', paper_bgcolor='#131722' # TradingView 暗黑風格
+            plot_bgcolor='#131722', paper_bgcolor='#131722'
         )
         
-        # 強制 X 軸為時間連續格式，以免跨日/跨週末時斷線或排版跑掉
         fig.update_xaxes(type='date')
         
         st.plotly_chart(fig, use_container_width=True)
