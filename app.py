@@ -1,78 +1,111 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import requests
 
 # 設定網頁佈局
 st.set_page_config(page_title="NY Session Trading Strategy", layout="wide")
 
-st.title("📈 紐約盤開盤區間與交易時段反轉策略")
+st.title("📈 紐約盤開盤突破 (NY ORB) 交易機器人")
 st.markdown("""
-### 交易邏輯 (參考影片策略)
-1. **亞洲盤 (Asian Session)**: 建立流動性的盤整區間 (美東時間 20:00 - 03:00)。
-2. **倫敦盤 (London Session)**: 清掃亞洲盤流動性，製造假突破 (美東時間 03:00 - 08:00)。
-3. **紐約盤 (New York Session)**: 高交易量，真正的反轉趨勢或延續。
-4. **紐約開盤區間 (NY Opening Range)**: 標記美東時間 **09:30 - 09:45** 的高低點。
-5. **進場條件**: 
-   - 價格突破 09:30 - 09:45 區間，產生失衡 (Displacement)。
-   - 等待價格回踩該區間或公允價值缺口 (FVG)。
-   - (程式以突破後回踩作為模擬進場點，止盈為 1.5 倍風險報酬比)
+### 解決了 Yahoo 封鎖問題的新版本 🚀
+- **加密貨幣 (BTC/ETH)**：使用 Binance 公開 API，**無須 API Key，永久免費穩定**。
+- **傳統金融 (Gold/EUR)**：使用 Twelve Data API，需在左側輸入免費 API Key。
+---
+**交易邏輯 (參考影片策略)**
+1. **亞洲盤/倫敦盤**: 建立並清掃流動性。
+2. **紐約開盤區間 (NY ORB)**: 標記美東時間 **09:30 - 09:45** 的高低點。
+3. **進場條件**: 價格突破該區間，模擬進場，並設定 **1.5 倍盈虧比 (Risk-Reward)** 的止損與止盈。
 """)
 
 # 側邊欄設定
-st.sidebar.header("交易設定")
-asset_dict = {
-    "Bitcoin (BTC/USD)": "BTC-USD",
-    "Gold (XAU/USD)": "GC=F",
-    "Euro (EUR/USD)": "EURUSD=X"
-}
-selected_asset = st.sidebar.selectbox("選擇交易標的", list(asset_dict.keys()))
-ticker = asset_dict[selected_asset]
+st.sidebar.header("⚙️ 交易設定")
+data_source = st.sidebar.radio("選擇市場",["🟢 加密貨幣 (Binance 免費數據)", "🟡 外匯與黃金 (需 API Key)"])
 
-days_to_fetch = st.sidebar.slider("載入最近天數的數據", min_value=1, max_value=7, value=3)
+if data_source == "🟢 加密貨幣 (Binance 免費數據)":
+    asset_dict = {
+        "Bitcoin (BTC/USDT)": "BTCUSDT",
+        "Ethereum (ETH/USDT)": "ETHUSDT",
+        "Solana (SOL/USDT)": "SOLUSDT"
+    }
+    selected_asset = st.sidebar.selectbox("選擇交易標的", list(asset_dict.keys()))
+    ticker = asset_dict[selected_asset]
+    api_key = None
+else:
+    st.sidebar.markdown("👉[點此前往 Twelve Data 免費註冊獲取 Key](https://twelvedata.com/)")
+    api_key = st.sidebar.text_input("輸入 Twelve Data API Key", type="password")
+    asset_dict = {
+        "Gold (XAU/USD)": "XAU/USD",
+        "Euro (EUR/USD)": "EUR/USD"
+    }
+    selected_asset = st.sidebar.selectbox("選擇交易標的", list(asset_dict.keys()))
+    ticker = asset_dict[selected_asset]
 
-# 獲取數據 (使用 5 分鐘 K 線)
+days_to_fetch = st.sidebar.slider("載入最近天數", min_value=1, max_value=3, value=2)
+
+# --- 數據獲取函數 (快取 5 分鐘) ---
 @st.cache_data(ttl=300)
-def load_data(ticker, days):
-    # 🚨 移除自訂 Session，讓 yfinance 預設的 curl_cffi 引擎自動處理反爬蟲
-    data = yf.download(ticker, period=f"{days}d", interval="5m")
-    
-    if data.empty:
-        return data
-    
-    # 處理 multi-index columns (yfinance 新版回傳格式處理)
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.droplevel(1)
-        
-    # 轉換時區為美東時間 (New York)
-    if data.index.tz is None:
-        data.index = data.index.tz_localize('UTC').tz_convert('America/New_York')
+def load_binance_data(symbol, days):
+    limit = min(days * 288, 1000) # 5m K線每天288根，API最多支援1000根
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit={limit}"
+    res = requests.get(url)
+    if res.status_code != 200:
+        return None
+    data = res.json()
+    df = pd.DataFrame(data, columns=['datetime', 'Open', 'High', 'Low', 'Close', 'Volume', '_', '_', '_', '_', '_', '_'])
+    df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+    df.set_index('datetime', inplace=True)
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        df[col] = df[col].astype(float)
+    # 轉換為紐約時間
+    df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
+    return df
+
+@st.cache_data(ttl=300)
+def load_twelvedata_data(symbol, days, key):
+    limit = min(days * 288, 1000)
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize={limit}&timezone=America/New_York&apikey={key}"
+    res = requests.get(url)
+    data = res.json()
+    if 'values' not in data:
+        st.error(f"API 錯誤: {data.get('message', '請確認 API Key 是否正確')}")
+        return None
+    df = pd.DataFrame(data['values'])
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df.set_index('datetime', inplace=True)
+    for col in ['open', 'high', 'low', 'close']:
+        df[col] = df[col].astype(float)
+    df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'})
+    df = df.sort_index(ascending=True)
+    df.index = df.index.tz_localize('America/New_York')
+    return df
+
+# --- 載入數據 ---
+with st.spinner('正在從 API 獲取即時數據...'):
+    if data_source == "🟢 加密貨幣 (Binance 免費數據)":
+        df = load_binance_data(ticker, days_to_fetch)
     else:
-        data.index = data.index.tz_convert('America/New_York')
-        
-    return data
+        if not api_key:
+            st.warning("⚠️ 必須在左側側邊欄輸入 Twelve Data API Key 才能載入外匯/黃金數據。")
+            st.stop()
+        df = load_twelvedata_data(ticker, days_to_fetch, api_key)
 
-df = load_data(ticker, days_to_fetch)
-
-if df.empty:
+if df is None or df.empty:
     st.error("無法獲取數據，請稍後再試。")
     st.stop()
 
-# 選擇要查看的日期 (預設為最新交易日)
+# --- 選擇日期與策略邏輯 ---
 available_dates = sorted(list(set(df.index.date)), reverse=True)
 selected_date = st.sidebar.selectbox("選擇查看日期", available_dates)
 
-# 過濾出選擇的日期的數據
 df_day = df[df.index.date == selected_date]
-
 if df_day.empty:
     st.warning("該日期無可用的交易數據。")
     st.stop()
 
-# 計算 09:30 - 09:45 開盤區間 (ORB)
+# 標記 09:30 - 09:45 區間
 orb_start = datetime.combine(selected_date, datetime.strptime("09:30", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
 orb_end = datetime.combine(selected_date, datetime.strptime("09:45", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
 
@@ -87,126 +120,82 @@ if not df_orb.empty:
     orb_high = float(df_orb['High'].max())
     orb_low = float(df_orb['Low'].min())
     
-    # 尋找交易訊號 (突破後的回踩進場)
+    # 尋找突破訊號
     df_post_orb = df_day[df_day.index >= orb_end]
     
     for i in range(len(df_post_orb)):
         current_close = float(df_post_orb['Close'].iloc[i])
         current_time = df_post_orb.index[i]
         
-        # 做多訊號邏輯：價格突破 ORB 上緣
+        # 做多
         if current_close > orb_high:
             entry_price = current_close
-            sl_price = orb_low  # 止損設在區間下緣
-            risk = entry_price - sl_price
-            tp_price = entry_price + (risk * 1.5)  # 1.5倍盈虧比
-            
-            trade_signal = {
-                'Type': 'BUY (做多)',
-                'Time': current_time,
-                'Entry': entry_price,
-                'SL': sl_price,
-                'TP': tp_price
-            }
-            signal_msg = f"🟢 **出現做多訊號！** \n\n突破區間高點！\n- **時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: {entry_price:.4f}\n- **止損 (SL)**: {sl_price:.4f}\n- **止盈 (TP)**: {tp_price:.4f}"
+            sl_price = orb_low
+            tp_price = entry_price + ((entry_price - sl_price) * 1.5)
+            trade_signal = {'Type': 'BUY', 'Time': current_time, 'Entry': entry_price, 'SL': sl_price, 'TP': tp_price}
+            signal_msg = f"🟢 **出現做多訊號！** (突破區間高點)\n\n- **進場時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: `{entry_price:.4f}`\n- **止損 (SL)**: `{sl_price:.4f}`\n- **止盈 (TP)**: `{tp_price:.4f}`"
             break
             
-        # 做空訊號邏輯：價格跌破 ORB 下緣
+        # 做空
         elif current_close < orb_low:
             entry_price = current_close
-            sl_price = orb_high  # 止損設在區間上緣
-            risk = sl_price - entry_price
-            tp_price = entry_price - (risk * 1.5)  # 1.5倍盈虧比
-            
-            trade_signal = {
-                'Type': 'SELL (做空)',
-                'Time': current_time,
-                'Entry': entry_price,
-                'SL': sl_price,
-                'TP': tp_price
-            }
-            signal_msg = f"🔴 **出現做空訊號！** \n\n跌破區間低點！\n- **時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: {entry_price:.4f}\n- **止損 (SL)**: {sl_price:.4f}\n- **止盈 (TP)**: {tp_price:.4f}"
+            sl_price = orb_high
+            tp_price = entry_price - ((sl_price - entry_price) * 1.5)
+            trade_signal = {'Type': 'SELL', 'Time': current_time, 'Entry': entry_price, 'SL': sl_price, 'TP': tp_price}
+            signal_msg = f"🔴 **出現做空訊號！** (跌破區間低點)\n\n- **進場時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: `{entry_price:.4f}`\n- **止損 (SL)**: `{sl_price:.4f}`\n- **止盈 (TP)**: `{tp_price:.4f}`"
             break
-    
+            
     if not trade_signal:
-        signal_msg = "⏳ 今日走勢尚在區間內，未出現明顯的突破進場訊號。"
+        signal_msg = "⏳ 今日開盤區間已確立，走勢尚在區間內，等待突破..."
 
-# 顯示訊號
-st.subheader("💡 即時交易訊號")
-st.info(signal_msg)
+# --- 畫面顯示 ---
+st.subheader(f"💡 即時交易訊號 ({selected_date})")
+if "做多" in signal_msg or "做空" in signal_msg:
+    st.success(signal_msg)
+else:
+    st.info(signal_msg)
 
-# 繪製 Plotly K線圖
+# 繪製圖表
 fig = go.Figure()
 
 # 加入 K 線
 fig.add_trace(go.Candlestick(
-    x=df_day.index,
-    open=df_day['Open'],
-    high=df_day['High'],
-    low=df_day['Low'],
-    close=df_day['Close'],
-    name="5m K線"
+    x=df_day.index, open=df_day['Open'], high=df_day['High'],
+    low=df_day['Low'], close=df_day['Close'], name="5m K線"
 ))
 
-# 標示 ORB 區間 (09:30 - 09:45)
 if orb_high is not None and orb_low is not None:
-    # 高點線
-    fig.add_hline(y=orb_high, line_dash="dash", line_color="orange", annotation_text="ORB High (區間高點)")
-    # 低點線
-    fig.add_hline(y=orb_low, line_dash="dash", line_color="orange", annotation_text="ORB Low (區間低點)", annotation_position="bottom right")
+    # 畫 ORB 區間線
+    fig.add_hline(y=orb_high, line_dash="dash", line_color="orange", annotation_text="ORB High 09:45")
+    fig.add_hline(y=orb_low, line_dash="dash", line_color="orange", annotation_text="ORB Low 09:45", annotation_position="bottom right")
 
-    # 若有交易訊號，在圖上畫出止盈止損線和進場點
+    # 畫出止損與止盈標記
     if trade_signal:
-        fig.add_vline(x=trade_signal['Time'], line_width=2, line_dash="dot", line_color="blue")
+        fig.add_vline(x=trade_signal['Time'], line_width=2, line_dash="dot", line_color="white")
         
-        # 進場點
         fig.add_trace(go.Scatter(
-            x=[trade_signal['Time']], 
-            y=[trade_signal['Entry']], 
-            mode='markers+text',
-            marker=dict(color='blue', size=10),
-            text=["進場 (Entry)"],
-            textposition="middle right",
-            name="進場點"
+            x=[trade_signal['Time']], y=[trade_signal['Entry']], mode='markers+text',
+            marker=dict(color='yellow', size=12), text=["進場點"], textposition="middle right", name="Entry"
         ))
         
-        # 止損線 (紅色)
-        fig.add_hline(y=trade_signal['SL'], line_width=2, line_color="red", annotation_text=f"止損 SL: {trade_signal['SL']:.4f}")
-        
-        # 止盈線 (綠色)
-        fig.add_hline(y=trade_signal['TP'], line_width=2, line_color="green", annotation_text=f"止盈 TP: {trade_signal['TP']:.4f}")
+        fig.add_hline(y=trade_signal['SL'], line_width=2, line_color="red", annotation_text=f"止損 SL ({trade_signal['SL']:.4f})")
+        fig.add_hline(y=trade_signal['TP'], line_width=2, line_color="green", annotation_text=f"止盈 TP 1.5R ({trade_signal['TP']:.4f})")
 
-# 設置圖表版面
-fig.update_layout(
-    title=f"{selected_asset} - 5分鐘 K線圖 (美東時間)",
-    yaxis_title="價格 (USD)",
-    xaxis_title="美東時間 (EST)",
-    height=700,
-    xaxis_rangeslider_visible=False,
-    template="plotly_dark"
-)
-
-# 畫出不同交易時段的背景色 (Asian, London, NY)
-# 亞洲盤 (前一日 20:00 - 03:00) / 倫敦盤 (03:00 - 08:00) / 紐約盤 (08:00 - 17:00)
+# 背景顏色：時段劃分
 session_colors =[
-    ("00:00", "03:00", "rgba(255, 255, 0, 0.05)", "Asian Session (End)"),
+    ("00:00", "03:00", "rgba(255, 255, 0, 0.05)", "Asian Session"),
     ("03:00", "08:00", "rgba(0, 255, 255, 0.05)", "London Session"),
     ("08:00", "17:00", "rgba(255, 0, 255, 0.05)", "New York Session")
 ]
-
 for start_time, end_time, color, name in session_colors:
     s_time = datetime.combine(selected_date, datetime.strptime(start_time, "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
     e_time = datetime.combine(selected_date, datetime.strptime(end_time, "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
-    
-    fig.add_vrect(
-        x0=s_time, x1=e_time,
-        fillcolor=color, opacity=1, layer="below", line_width=0,
-        annotation_text=name, annotation_position="top left"
-    )
+    fig.add_vrect(x0=s_time, x1=e_time, fillcolor=color, opacity=1, layer="below", line_width=0, annotation_text=name, annotation_position="top left")
+
+fig.update_layout(
+    title=f"{selected_asset} 走勢圖",
+    yaxis_title="價格 (USD)", xaxis_title="美東時間 (EST)",
+    height=750, xaxis_rangeslider_visible=False, template="plotly_dark"
+)
 
 st.plotly_chart(fig, use_container_width=True)
-
-st.markdown("""
----
-**免責聲明**：此程式僅用於展示影片中提及之策略邏輯（開盤區間突破與盈虧比計算），所產生的交易訊號僅供教學與學術研究參考，**不構成任何金融投資建議**。
-""")
