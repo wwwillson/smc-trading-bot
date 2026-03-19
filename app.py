@@ -9,19 +9,20 @@ from datetime import timedelta
 st.set_page_config(page_title="EUR/USD 流動性清掃狙擊策略", layout="wide")
 st.title("🎯 EUR/USD 流動性清掃狙擊策略 (M15 Sweep + M1 Entry)")
 
-with st.expander("📖 策略邏輯與新增的高階過濾說明"):
+with st.expander("📖 最新嚴格進場規則與 API 說明"):
     st.markdown("""
-    * **時間顯示**：所有時間已自動轉換為 **台灣時間 (UTC+8)**。
-    * **流動性清掃 (Liquidity Sweep)**：尋找過去 15 分鐘 K 線的前高或前低。
-    * 🌟 **新增 - 1小時時間間隔**：假突破 K 線與前高/前低之間，必須**至少相隔 1 小時** (即 4 根 M15 K線)。
-    * 🌟 **新增 - 明顯拉回 (Clear Pullback)**：在間隔期間，價格必須出現明顯的結構性回撤 (回撤深度大於近期平均波動，且跌破/突破前一波的 K 線極值)，確保它是一個清晰的獨立波段。
-    * **假突破 (Fakeout)**：當前 M15 K線刺穿前高/前低，但收盤卻收在區間內（留下長引線）。
-    * **精準入場 (Sniper Entry)**：切換至 1分鐘圖，當 M1 價格反向突破 M15 的開盤價時立刻進場。
-    * **圖表標示 (顯示 M15 K線)**：
-        * **K線圖**：底圖為乾淨的 15 分鐘級別。
-        * **虛線**：標示出被清掃的「前高/前低」水平位。
-        * **半透明圓圈**：標示假突破發生的瞬間。
-        * **紅色/綠色區塊**：精準標示從 1 分鐘級別進場的點位，直到觸及止損或止盈的區間。
+    ### 嚴格過濾邏輯 (符合真實 SMC Sweep)
+    1. **時間顯示**：所有時間已自動轉換為 **台灣時間 (UTC+8)**。
+    2. **強制實體收回 (Body Rejection)**：突破前高/前低的那根 15 分鐘 K 線，其 **開盤價(Open)** 與 **收盤價(Close)** 都必須收在水平線以內，確保突破的部分「純粹只有引線 (Wick)」。
+    3. **水平線完整性**：前波高低點產生後，中間間隔的 1 小時內，價格不能曾經刺穿過該水平線，保證這是一次新鮮的流動性清掃。
+    4. **精準入場 (Sniper Entry)**：切換至 1分鐘圖，當 M1 價格反向突破 M15 的開盤價時立刻進場。
+
+    ### ❓ 關於免費 1 分鐘 API 的選擇
+    金融市場中「超過 7 天以上的 1 分鐘歷史數據」通常是付費級別的，以下是常見選項：
+    * **Yahoo Finance (本程式預設)**：免註冊最方便，但官方嚴格限制 `1m` 資料最多只能抓 **最近 7 天**。
+    * **Alpha Vantage / OANDA API**：可以抓幾個月的 1m 外匯資料，但**必須去官網免費註冊取得 API Key**，且免費用戶有每分鐘呼叫次數限制。
+    * **Binance (幣安 API)**：如果願意回測加密貨幣 (如 `EUR/USDT`)，幣安的 API 是完全免費且可抓取數年的 1m 資料。
+    * **👑 最佳解 (CSV上傳)**：從 MT4 / MT5 或 TradingView 匯出半年的 1 分鐘 K 線存成 CSV，丟進左側上傳區，這是專業量化回測最無延遲、最推薦的作法。
     """)
 
 st.sidebar.header("⚙️ 參數設定")
@@ -43,7 +44,7 @@ def load_yf_data():
     m1_data.dropna(inplace=True)
     m15_data.dropna(inplace=True)
 
-    # 🕒 轉換為台灣時間 (Asia/Taipei)
+    # 轉換為台灣時間
     if m1_data.index.tz is not None:
         m1_data.index = m1_data.index.tz_convert('Asia/Taipei').tz_localize(None)
     if m15_data.index.tz is not None:
@@ -71,7 +72,7 @@ m1_data, m15_data = None, None
 if data_source == "Yahoo Finance (限制最近7天)":
     m1_data, m15_data = load_yf_data()
 else:
-    uploaded_file = st.sidebar.file_uploader("上傳 1分鐘 K線 CSV (預設時間為UTC)", type="csv")
+    uploaded_file = st.sidebar.file_uploader("上傳 1分鐘 K線 CSV (需包含 Datetime, Open, High, Low, Close)", type="csv")
     if uploaded_file is not None:
         raw_df = pd.read_csv(uploaded_file)
         m1_data, m15_data = process_csv_data(raw_df)
@@ -84,14 +85,16 @@ def run_strategy(m1, m15, rr):
     trades =[]
     
     for i in range(20, len(m15) - 1):
-        # 🌟 條件 1: 至少相隔 1 小時 (15分K線需相距至少 4 根)
-        # 所以尋找前高低點的視窗，只看到 i-3 之前 (即最高限制在 i-4 發生)
+        # 尋找前高低點的視窗：至少相距 4 根 K 線 (確保有1小時以上的獨立性)
         search_window = m15.iloc[i-20 : i-3] 
+        if search_window.empty: continue
         
+        # 找前高
         prev_high = search_window['High'].max()
         prev_high_time = search_window['High'].idxmax()
         prev_high_idx = m15.index.get_loc(prev_high_time)
         
+        # 找前低
         prev_low = search_window['Low'].min()
         prev_low_time = search_window['Low'].idxmin()
         prev_low_idx = m15.index.get_loc(prev_low_time)
@@ -104,40 +107,47 @@ def run_strategy(m1, m15, rr):
         swept_level = 0
         swept_time = None
         
-        # 🌟 條件 2: 計算近期 K 線的平均波動 (作為"明顯拉回"的參考閥值)
         avg_range = (m15['High'].iloc[i-14:i] - m15['Low'].iloc[i-14:i]).mean()
         
-        # 判斷作空 Fakeout (向上清掃前高流動性)
-        if current_m15['High'] > prev_high and current_m15['Close'] < prev_high:
-            gap_df = m15.iloc[prev_high_idx+1 : i]
-            peak_candle = m15.iloc[prev_high_idx]
-            pullback_depth = prev_high - gap_df['Low'].min()
-            
-            # 判斷明顯拉回：中間過程的低點跌破前高K線低點，且回撤深度大於平均 K 線波動
-            if not gap_df.empty and gap_df['Low'].min() < peak_candle['Low'] and pullback_depth > avg_range:
-                sweep_type = 'Short'
-                sl_price = current_m15['High']
-                swept_level = prev_high
-                swept_time = prev_high_time
-                
-        # 判斷作多 Fakeout (向下清掃前低流動性)
-        elif current_m15['Low'] < prev_low and current_m15['Close'] > prev_low:
-            gap_df = m15.iloc[prev_low_idx+1 : i]
-            trough_candle = m15.iloc[prev_low_idx]
-            pullback_depth = gap_df['High'].max() - prev_low
-            
-            # 判斷明顯拉回：中間過程的高點突破前低K線高點，且反彈深度大於平均 K 線波動
-            if not gap_df.empty and gap_df['High'].max() > trough_candle['High'] and pullback_depth > avg_range:
-                sweep_type = 'Long'
-                sl_price = current_m15['Low']
-                swept_level = prev_low
-                swept_time = prev_low_time
+        # ---------------------------------------------
+        # 🟢 判斷做空 Fakeout (清掃前高流動性)
+        # ---------------------------------------------
+        gap_df_high = m15.iloc[prev_high_idx+1 : i]
+        # 確保區隔期間「從未」有人破壞過這條前高水平線
+        if not gap_df_high.empty and gap_df_high['High'].max() < prev_high:
+            # 🌟 新增判斷：當前 K 刺穿前高，但實體(Open與Close)皆收在水平線以內！
+            if current_m15['High'] > prev_high and current_m15['Close'] < prev_high and current_m15['Open'] < prev_high:
+                pullback_depth = prev_high - gap_df_high['Low'].min()
+                # 確保拉回深度夠深
+                if gap_df_high['Low'].min() < m15.iloc[prev_high_idx]['Low'] and pullback_depth > avg_range:
+                    sweep_type = 'Short'
+                    sl_price = current_m15['High']
+                    swept_level = prev_high
+                    swept_time = prev_high_time
+
+        # ---------------------------------------------
+        # 🔴 判斷做多 Fakeout (清掃前低流動性)
+        # ---------------------------------------------
+        if not sweep_type: # 只有沒做空時才檢查做多
+            gap_df_low = m15.iloc[prev_low_idx+1 : i]
+            # 確保區隔期間「從未」有人破壞過這條前低水平線
+            if not gap_df_low.empty and gap_df_low['Low'].min() > prev_low:
+                # 🌟 新增判斷：當前 K 跌破前低，但實體(Open與Close)皆收在水平線以上！
+                if current_m15['Low'] < prev_low and current_m15['Close'] > prev_low and current_m15['Open'] > prev_low:
+                    pullback_depth = gap_df_low['High'].max() - prev_low
+                    # 確保反彈深度夠深
+                    if gap_df_low['High'].max() > m15.iloc[prev_low_idx]['High'] and pullback_depth > avg_range:
+                        sweep_type = 'Long'
+                        sl_price = current_m15['Low']
+                        swept_level = prev_low
+                        swept_time = prev_low_time
             
         if sweep_type:
             trigger_time_start = m15.index[i+1]
             trigger_time_end = trigger_time_start + timedelta(minutes=15)
             fakeout_candle_time = m15.index[i] 
             
+            # 切換至 M1 進行精準入場計算
             m1_window = m1[(m1.index >= trigger_time_start) & (m1.index < trigger_time_end)]
             if m1_window.empty: continue
             
@@ -186,11 +196,11 @@ def run_strategy(m1, m15, rr):
     return pd.DataFrame(trades)
 
 if m1_data is not None and m15_data is not None:
-    with st.spinner('正在分析走勢與過濾無效訊號...'):
+    with st.spinner('正在分析走勢與嚴格過濾無效訊號...'):
         trades_df = run_strategy(m1_data, m15_data, rr_ratio)
         
     if trades_df.empty:
-        st.warning("在此時間段內未觸發任何符合「相隔一小時且明顯拉回」的完美交易訊號。")
+        st.warning("在此時間段內未觸發符合「水平線未被破壞」且「實體完全收回」的完美交易訊號。")
     else:
         st.subheader("📊 交易紀錄與回測結果 (台灣時間)")
         
@@ -228,10 +238,12 @@ if m1_data is not None and m15_data is not None:
                         low=plot_m15['Low'], close=plot_m15['Close'],
                         name="15M K線", increasing_line_color='lightgray', decreasing_line_color='gray')])
         
+        # 畫水平流動性線
         fig.add_shape(type="line", x0=trade['Swept Time'], y0=trade['Swept Level'], x1=end_plot, y1=trade['Swept Level'],
                       line=dict(color="rgba(200, 200, 200, 0.6)", width=1, dash="dot"))
         fig.add_annotation(x=trade['Swept Time'], y=trade['Swept Level'], text="Prev M15 H/L", showarrow=False, yshift=10, font=dict(color="white"))
 
+        # 清掃圓圈標記
         circle_color = "rgba(255, 50, 50, 0.4)" if trade['Type'] == 'Short' else "rgba(50, 255, 50, 0.4)"
         fig.add_trace(go.Scatter(
             x=[trade['Fakeout Time'] + timedelta(minutes=7.5)], 
@@ -240,11 +252,11 @@ if m1_data is not None and m15_data is not None:
             name='Liquidity Sweep (清掃)'
         ))
 
+        # Risk & Reward 區塊
         exit_time_plot = trade['Exit Time'] if pd.notna(trade['Exit Time']) else end_plot
         
         fig.add_shape(type="rect", x0=trade['Entry Time'], y0=trade['Entry Price'], x1=exit_time_plot, y1=trade['SL'],
                       fillcolor="rgba(255, 0, 0, 0.15)", line_width=0, layer="below")
-        
         fig.add_shape(type="rect", x0=trade['Entry Time'], y0=trade['Entry Price'], x1=exit_time_plot, y1=trade['TP'],
                       fillcolor="rgba(0, 150, 255, 0.15)", line_width=0, layer="below")
 
