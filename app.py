@@ -2,177 +2,208 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
-import numpy as np
+from datetime import datetime, timedelta
+import pytz
 
-# 設定網頁版面
-st.set_page_config(page_title="SMC 聰明錢交易策略系統", layout="wide")
+# 設定網頁佈局
+st.set_page_config(page_title="NY Session Trading Strategy", layout="wide")
 
-# --- UI：側邊欄設定 ---
-st.sidebar.header("⚙️ 交易設定")
-asset_choice = st.sidebar.selectbox(
-    "選擇交易標的",["Bitcoin (BTC/USD)", "Gold (XAU/USD)", "Euro (EUR/USD)"]
-)
+st.title("📈 紐約盤開盤區間與交易時段反轉策略")
+st.markdown("""
+### 交易邏輯 (參考影片策略)
+1. **亞洲盤 (Asian Session)**: 建立流動性的盤整區間 (美東時間 20:00 - 03:00)。
+2. **倫敦盤 (London Session)**: 清掃亞洲盤流動性，製造假突破 (美東時間 03:00 - 08:00)。
+3. **紐約盤 (New York Session)**: 高交易量，真正的反轉趨勢或延續。
+4. **紐約開盤區間 (NY Opening Range)**: 標記美東時間 **09:30 - 09:45** 的高低點。
+5. **進場條件**: 
+   - 價格突破 09:30 - 09:45 區間，產生失衡 (Displacement)。
+   - 等待價格回踩該區間或公允價值缺口 (FVG)。
+   - (程式以突破後回踩作為模擬進場點，止盈為 1.5 倍風險報酬比)
+""")
 
-# 對應 Yahoo Finance 的代碼
-ticker_map = {
+# 側邊欄設定
+st.sidebar.header("交易設定")
+asset_dict = {
     "Bitcoin (BTC/USD)": "BTC-USD",
     "Gold (XAU/USD)": "GC=F",
     "Euro (EUR/USD)": "EURUSD=X"
 }
-ticker = ticker_map[asset_choice]
+selected_asset = st.sidebar.selectbox("選擇交易標的", list(asset_dict.keys()))
+ticker = asset_dict[selected_asset]
 
-timeframe = st.sidebar.selectbox("時間框架 (Timeframe)",["15m", "1h", "1d"], index=1)
-period_map = {"15m": "5d", "1h": "1mo", "1d": "1y"}
+days_to_fetch = st.sidebar.slider("載入最近天數的數據", min_value=1, max_value=7, value=3)
 
-# 盈虧比設定
-rr_ratio = st.sidebar.number_input("盈虧比 (Risk/Reward Ratio)", min_value=1.0, max_value=5.0, value=2.0, step=0.5)
-
-# --- 下載數據 ---
-@st.cache_data(ttl=300) # 緩存5分鐘
-def load_data(ticker, period, interval):
-    # 【修正】使用 yf.Ticker().history() 避免新版 yfinance 產生多層索引 (MultiIndex) 問題
-    stock = yf.Ticker(ticker)
-    df = stock.history(period=period, interval=interval)
-    df.dropna(inplace=True)
-    return df
-
-with st.spinner('獲取最新市場數據中...'):
-    df = load_data(ticker, period_map[timeframe], timeframe)
-
-# --- 交易邏輯演算法 (簡易版 SMC) ---
-def identify_smc_signals(df, window=5):
-    # 尋找波段高低點 (Swing Highs / Swing Lows)
-    df['Swing_High'] = df['High'][(df['High'] == df['High'].rolling(window=window*2+1, center=True).max())]
-    df['Swing_Low'] = df['Low'][(df['Low'] == df['Low'].rolling(window=window*2+1, center=True).min())]
+# 獲取數據 (使用 5 分鐘 K 線)
+@st.cache_data(ttl=300)
+def load_data(ticker, days):
+    # 抓取數據
+    data = yf.download(ticker, period=f"{days}d", interval="5m")
+    if data.empty:
+        return data
     
-    # 填補波段數據以便對比
-    df['Last_SH'] = df['Swing_High'].ffill()
-    df['Last_SL'] = df['Swing_Low'].ffill()
-    
-    signals =[]
-    in_position = False
-    
-    # 模擬影片邏輯：Market Structure Shift (市場結構轉變)
-    for i in range(1, len(df)):
-        # 【修正】確保取出的數值絕對是 float 純數字，避免 Series 比較錯誤
-        current_close = float(df['Close'].iloc[i])
+    # 處理 multi-index columns (yfinance 新版有時候會有)
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.droplevel(1)
         
-        last_sh_val = df['Last_SH'].iloc[i-1]
-        last_sl_val = df['Last_SL'].iloc[i-1]
-        last_sh = float(last_sh_val) if not pd.isna(last_sh_val) else np.nan
-        last_sl = float(last_sl_val) if not pd.isna(last_sl_val) else np.nan
-        
-        # 做多訊號 (Bullish Market Shift)
-        if current_close > last_sh and not in_position and not np.isnan(last_sh):
-            entry_price = current_close
-            # 【修正】加入 max(0, i-window) 避免索引變成負數
-            sl_price = float(df['Low'].iloc[max(0, i-window):i].min()) 
-            risk = entry_price - sl_price
-            tp_price = entry_price + (risk * rr_ratio) # 止盈依據盈虧比計算
-            
-            if risk > 0:
-                signals.append((df.index[i], 'Buy', entry_price, sl_price, tp_price))
-                in_position = True
-                
-        # 做空訊號 (Bearish Market Shift)
-        elif current_close < last_sl and not in_position and not np.isnan(last_sl):
-            entry_price = current_close
-            sl_price = float(df['High'].iloc[max(0, i-window):i].max()) 
-            risk = sl_price - entry_price
-            tp_price = entry_price - (risk * rr_ratio)
-            
-            if risk > 0:
-                signals.append((df.index[i], 'Sell', entry_price, sl_price, tp_price))
-                in_position = True
-                
-        # 簡單的平倉邏輯 (觸及SL或TP) 允許下一次訊號
-        if in_position:
-            last_signal = signals[-1]
-            curr_low = float(df['Low'].iloc[i])
-            curr_high = float(df['High'].iloc[i])
-            
-            if last_signal[1] == 'Buy':
-                if curr_low <= last_signal[3] or curr_high >= last_signal[4]:
-                    in_position = False
-            elif last_signal[1] == 'Sell':
-                if curr_high >= last_signal[3] or curr_low <= last_signal[4]:
-                    in_position = False
-
-    return df, signals
-
-df, signals = identify_smc_signals(df)
-
-# --- 繪製 K 線圖與標示 ---
-fig = go.Figure(data=[go.Candlestick(x=df.index,
-                open=df['Open'], high=df['High'],
-                low=df['Low'], close=df['Close'],
-                name='K線')])
-
-# 取出最後一個訊號來畫止損止盈線
-latest_signal = None
-if signals:
-    latest_signal = signals[-1]
-    
-    # 在圖表上標示所有訊號點
-    for sig in signals:
-        if sig[1] == 'Buy':
-            fig.add_trace(go.Scatter(x=[sig[0]], y=[sig[2]], mode='markers', 
-                                     marker=dict(symbol='triangle-up', color='green', size=15), name='買入訊號'))
-        else:
-            fig.add_trace(go.Scatter(x=[sig[0]], y=[sig[2]], mode='markers', 
-                                     marker=dict(symbol='triangle-down', color='red', size=15), name='賣出訊號'))
-
-    # 為最新訊號繪製 Entry, SL, TP 參考線與區塊
-    date, sig_type, entry, sl, tp = latest_signal
-    
-    # 畫止盈區間
-    fig.add_hrect(y0=entry, y1=tp, fillcolor="green", opacity=0.1, line_width=0, annotation_text=f"TP 止盈 ({tp:.4f})")
-    # 畫止損區間
-    fig.add_hrect(y0=entry, y1=sl, fillcolor="red", opacity=0.1, line_width=0, annotation_text=f"SL 止損 ({sl:.4f})")
-    # 入場線
-    fig.add_hline(y=entry, line_dash="dash", line_color="blue", annotation_text=f"Entry 進場 ({entry:.4f})")
-
-fig.update_layout(title=f"{asset_choice} 即時交易圖表與 SMC 訊號",
-                  yaxis_title='價格', xaxis_title='時間',
-                  template='plotly_dark', height=600,
-                  xaxis_rangeslider_visible=False) # 關閉底部的時間滑桿讓版面更乾淨
-
-# --- UI：主畫面 ---
-st.title("📈 SMC 聰明錢概念交易系統")
-st.markdown("參考影片中的 SMC (Smart Money Concepts) 交易方式，本系統具備以下功能與邏輯。")
-
-col1, col2 = st.columns([1, 2.5])
-
-with col1:
-    st.subheader("📝 影片交易邏輯還原")
-    st.markdown("""
-    1. **判斷結構 (Market Structure)**：尋找市場的波段高點 (Swing High) 與波段低點 (Swing Low)。
-    2. **流動性清掃與結構轉變 (Market Shift)**：當價格強勢突破近期的波段高/低點，代表趨勢可能發生反轉。
-    3. **進場點 (POI/Entry)**：在結構破壞後的下一根 K 線進場（模擬影片中的回調或破位確認）。
-    4. **止損配置 (Stop Loss)**：多單止損設在近期波段低點下方；空單設在波段高點上方。
-    5. **止盈配置 (Take Profit)**：嚴格執行風險回報比（左側面板可動態調整）。
-    """)
-    
-    if latest_signal:
-        st.success(f"**最新交易提示 ({latest_signal[0].strftime('%Y-%m-%d %H:%M')})**")
-        if latest_signal[1] == 'Buy':
-            st.markdown(f"""
-            🟢 **方向**：做多 (Buy)  
-            💵 **進場價**：{latest_signal[2]:.4f}  
-            🛑 **止損價 (SL)**：{latest_signal[3]:.4f}  
-            🎯 **止盈價 (TP)**：{latest_signal[4]:.4f}
-            """)
-        else:
-            st.markdown(f"""
-            🔴 **方向**：做空 (Sell)  
-            💵 **進場價**：{latest_signal[2]:.4f}  
-            🛑 **止損價 (SL)**：{latest_signal[3]:.4f}  
-            🎯 **止盈價 (TP)**：{latest_signal[4]:.4f}
-            """)
+    # 轉換時區為美東時間 (New York)
+    if data.index.tz is None:
+        data.index = data.index.tz_localize('UTC').tz_convert('America/New_York')
     else:
-        st.info("目前無最新交易訊號，等待 Market Shift 發生...")
+        data.index = data.index.tz_convert('America/New_York')
+    return data
 
-with col2:
-    st.plotly_chart(fig, use_container_width=True)
+df = load_data(ticker, days_to_fetch)
 
-st.warning("⚠️ **免責聲明**：本程式為教育與演算法展示用途，將主觀的 SMC 邏輯簡化為程式碼。實際交易請配合多時間框架與嚴格資金控管，不構成財務建議。")
+if df.empty:
+    st.error("無法獲取數據，請稍後再試。")
+    st.stop()
+
+# 選擇要查看的日期 (預設為最新交易日)
+available_dates = sorted(list(set(df.index.date)), reverse=True)
+selected_date = st.sidebar.selectbox("選擇查看日期", available_dates)
+
+# 過濾出選擇的日期的數據
+df_day = df[df.index.date == selected_date]
+
+if df_day.empty:
+    st.warning("該日期無可用的交易數據。")
+    st.stop()
+
+# 計算 09:30 - 09:45 開盤區間 (ORB)
+orb_start = datetime.combine(selected_date, datetime.strptime("09:30", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
+orb_end = datetime.combine(selected_date, datetime.strptime("09:45", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
+
+df_orb = df_day[(df_day.index >= orb_start) & (df_day.index < orb_end)]
+
+orb_high = None
+orb_low = None
+signal_msg = "🕒 今日尚未出現符合條件的開盤區間 (09:30-09:45) 數據。"
+trade_signal = None
+
+if not df_orb.empty:
+    orb_high = float(df_orb['High'].max())
+    orb_low = float(df_orb['Low'].min())
+    
+    # 尋找交易訊號 (突破後的回踩進場)
+    df_post_orb = df_day[df_day.index >= orb_end]
+    
+    for i in range(len(df_post_orb)):
+        current_close = float(df_post_orb['Close'].iloc[i])
+        current_time = df_post_orb.index[i]
+        
+        # 做多訊號邏輯：價格突破 ORB 上緣
+        if current_close > orb_high:
+            entry_price = current_close
+            sl_price = orb_low  # 止損設在區間下緣
+            risk = entry_price - sl_price
+            tp_price = entry_price + (risk * 1.5)  # 1.5倍盈虧比
+            
+            trade_signal = {
+                'Type': 'BUY (做多)',
+                'Time': current_time,
+                'Entry': entry_price,
+                'SL': sl_price,
+                'TP': tp_price
+            }
+            signal_msg = f"🟢 **出現做多訊號！** \n\n突破區間高點！\n- **時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: {entry_price:.4f}\n- **止損 (SL)**: {sl_price:.4f}\n- **止盈 (TP)**: {tp_price:.4f}"
+            break
+            
+        # 做空訊號邏輯：價格跌破 ORB 下緣
+        elif current_close < orb_low:
+            entry_price = current_close
+            sl_price = orb_high  # 止損設在區間上緣
+            risk = sl_price - entry_price
+            tp_price = entry_price - (risk * 1.5)  # 1.5倍盈虧比
+            
+            trade_signal = {
+                'Type': 'SELL (做空)',
+                'Time': current_time,
+                'Entry': entry_price,
+                'SL': sl_price,
+                'TP': tp_price
+            }
+            signal_msg = f"🔴 **出現做空訊號！** \n\n跌破區間低點！\n- **時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: {entry_price:.4f}\n- **止損 (SL)**: {sl_price:.4f}\n- **止盈 (TP)**: {tp_price:.4f}"
+            break
+    
+    if not trade_signal:
+        signal_msg = "⏳ 今日走勢尚在區間內，未出現明顯的突破進場訊號。"
+
+# 顯示訊號
+st.subheader("💡 即時交易訊號")
+st.info(signal_msg)
+
+# 繪製 Plotly K線圖
+fig = go.Figure()
+
+# 加入 K 線
+fig.add_trace(go.Candlestick(
+    x=df_day.index,
+    open=df_day['Open'],
+    high=df_day['High'],
+    low=df_day['Low'],
+    close=df_day['Close'],
+    name="5m K線"
+))
+
+# 標示 ORB 區間 (09:30 - 09:45)
+if orb_high is not None and orb_low is not None:
+    # 高點線
+    fig.add_hline(y=orb_high, line_dash="dash", line_color="orange", annotation_text="ORB High (區間高點)")
+    # 低點線
+    fig.add_hline(y=orb_low, line_dash="dash", line_color="orange", annotation_text="ORB Low (區間低點)", annotation_position="bottom right")
+
+    # 若有交易訊號，在圖上畫出止盈止損線和進場點
+    if trade_signal:
+        fig.add_vline(x=trade_signal['Time'], line_width=2, line_dash="dot", line_color="blue")
+        
+        # 進場點
+        fig.add_trace(go.Scatter(
+            x=[trade_signal['Time']], 
+            y=[trade_signal['Entry']], 
+            mode='markers+text',
+            marker=dict(color='blue', size=10),
+            text=["進場 (Entry)"],
+            textposition="middle right",
+            name="進場點"
+        ))
+        
+        # 止損線 (紅色)
+        fig.add_hline(y=trade_signal['SL'], line_width=2, line_color="red", annotation_text=f"止損 SL: {trade_signal['SL']:.4f}")
+        
+        # 止盈線 (綠色)
+        fig.add_hline(y=trade_signal['TP'], line_width=2, line_color="green", annotation_text=f"止盈 TP: {trade_signal['TP']:.4f}")
+
+# 設置圖表版面
+fig.update_layout(
+    title=f"{selected_asset} - 5分鐘 K線圖 (美東時間)",
+    yaxis_title="價格 (USD)",
+    xaxis_title="美東時間 (EST)",
+    height=700,
+    xaxis_rangeslider_visible=False,
+    template="plotly_dark"
+)
+
+# 畫出不同交易時段的背景色 (Asian, London, NY)
+# 亞洲盤 (前一日 20:00 - 03:00) / 倫敦盤 (03:00 - 08:00) / 紐約盤 (08:00 - 17:00)
+session_colors =[
+    ("00:00", "03:00", "rgba(255, 255, 0, 0.05)", "Asian Session (End)"),
+    ("03:00", "08:00", "rgba(0, 255, 255, 0.05)", "London Session"),
+    ("08:00", "17:00", "rgba(255, 0, 255, 0.05)", "New York Session")
+]
+
+for start_time, end_time, color, name in session_colors:
+    s_time = datetime.combine(selected_date, datetime.strptime(start_time, "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
+    e_time = datetime.combine(selected_date, datetime.strptime(end_time, "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
+    
+    fig.add_vrect(
+        x0=s_time, x1=e_time,
+        fillcolor=color, opacity=1, layer="below", line_width=0,
+        annotation_text=name, annotation_position="top left"
+    )
+
+st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("""
+---
+**免責聲明**：此程式僅用於展示影片中提及之策略邏輯（開盤區間突破與盈虧比計算），所產生的交易訊號僅供教學與學術研究參考，**不構成任何金融投資建議**。
+""")
