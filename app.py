@@ -114,7 +114,10 @@ for i in range(1, len(unique_days)):
 
     # 4. 出場掃描 (進場後 ~ 16:00 判斷打到 TP 或 SL)
     if signal:
-        exit_session = df.loc[entry_time:f"{curr_day_str} 16:00"]
+        # 【修正錯誤】：將 Timestamp 轉換為字串，避免與後半段的字串混合切片時發生時區解析衝突
+        entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S')
+        exit_session = df.loc[entry_time_str:f"{curr_day_str} 16:00:00"]
+        
         outcome = "未結算/平倉"
         exit_time = exit_session.index[-1]
         exit_price = float(exit_session.iloc[-1]['Close'])
