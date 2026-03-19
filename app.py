@@ -1,243 +1,222 @@
 import streamlit as st
-import pandas as pd
 import yfinance as yf
-import plotly.graph_objects as plotly_go
-from datetime import datetime, timedelta
-import pytz
+import pandas as pd
+import plotly.graph_objects as go
+import numpy as np
+from datetime import timedelta
 
-# 設定網頁標題與寬度
-st.set_page_config(page_title="90-Min Scalping Strategy Backtester", layout="wide")
+# --- 頁面設定 ---
+st.set_page_config(page_title="4H Candle Box 交易策略回測", layout="wide")
 
-st.title("📈 90-Min 開盤首 5 分鐘突破回測策略回測系統")
-
-# --- 交易邏輯說明 ---
-with st.expander("📖 查看完整交易邏輯 (點擊展開)"):
+# --- 策略說明 ---
+st.title("📈 4H Candle Box 交易策略回測與視覺化")
+with st.expander("📖 查看影片交易邏輯說明", expanded=False):
     st.markdown("""
-    ### 策略步驟 (依據影片邏輯)：
-    1. **關鍵點位尋找 (流動性所在)**：標記出**前一天的高點 (PDH)** 與 **前一天的低點 (PDL)**。
-    2. **開盤首根 K 棒**：美東時間 (EST) 早上 9:30 開盤，標記 `9:30 - 9:35 AM` 這根 5 分鐘 K 棒的**高點 (5m_H)** 與 **低點 (5m_L)**。
-    3. **等待突破**：等待價格明確突破 `5m_H` (看多) 或跌破 `5m_L` (看空)。此策略僅在開盤前 90 分鐘內 (9:30 AM - 11:00 AM) 尋找進場機會。
-    4. **等待回測 (Retest)**：
-        * **做多 (Long)**：價格突破 `5m_H` 後，首次回踩至 `5m_H` 附近進場。
-        * **做空 (Short)**：價格跌破 `5m_L` 後，首次回彈至 `5m_L` 附近進場。
-    5. **止損與止盈設定**：
-        * **止損 (Stop Loss)**：做多的止損設在 `5m_L` 以下；做空的止損設在 `5m_H` 以上。
-        * **止盈 (Take Profit)**：做多目標看向前高 (`PDH`)；做空目標看向前低 (`PDL`)。若盈虧比不足 1:2，則強制設為 1:2 的固定盈虧比。
+    ### 策略核心邏輯 (基於影片內容)
+    本程式嚴格遵守影片中的「只交易一根 4 小時 K 棒」邏輯：
+    1. **決定方向 (Bias)**：每天取第一根 4 小時 K 棒（程式取每日開盤前 4 小時的數據組合）。如果收盤 > 開盤為**看漲**；收盤 < 開盤為**看跌**。
+    2. **畫出區間 (The Box)**：將這根 4H K 棒的高低點標出，並以斐波那契劃分區間 (0%, 25%, 50%, 75%, 100%)。
+    3. **尋找進場點 (Optimum Zone)**：
+        * **做多 (Buy)**：當價格回撤到頂部往下的 25%~50% 區間 (Optimum Zone) 時進場做多。
+        * **做空 (Sell)**：當價格反彈到底部往上的 25%~50% 區間 (Optimum Zone) 時進場做空。
+    4. **止損與止盈 (SL & TP)**：
+        * **止損 (SL)**：放在危險區 (Danger Zone)，即 75% 的位置。
+        * **止盈 (TP)**：固定設定為 1:2 的盈虧比 (Risk-Reward Ratio)。
     """)
 
 # --- 側邊欄設定 ---
 st.sidebar.header("⚙️ 參數設定")
-asset_choice = st.sidebar.selectbox(
-    "選擇交易品種",[("Bitcoin vs USD", "BTC-USD"), ("Gold vs USD", "GC=F"), ("Euro vs USD", "EURUSD=X")],
-    format_func=lambda x: x[0]
-)
-ticker_symbol = asset_choice[1]
+asset_dict = {
+    "Bitcoin vs USD (BTC-USD)": "BTC-USD",
+    "Gold vs USD (XAU-USD)": "GC=F",
+    "Euro vs USD (EUR-USD)": "EURUSD=X"
+}
+selected_asset_name = st.sidebar.selectbox("選擇交易標的", list(asset_dict.keys()))
+selected_asset = asset_dict[selected_asset_name]
 
-st.sidebar.warning("⚠️ yfinance 免費 API 限制：5分鐘 K 棒最多只能獲取過去 60 天的數據。")
-end_date = st.sidebar.date_input("結束日期", datetime.today())
-start_date = st.sidebar.date_input("開始日期", end_date - timedelta(days=59))
+days_to_fetch = st.sidebar.slider("選擇回測天數 (最高 360 天)", min_value=7, max_value=360, value=30, step=1)
 
-if (end_date - start_date).days > 60:
-    st.sidebar.error("日期範圍不能超過 60 天，請重新選擇。")
-    st.stop()
-
-# --- 抓取資料 ---
+# --- 獲取數據 ---
 @st.cache_data(ttl=3600)
-def load_data(ticker, start, end):
-    try:
-        # 抓取日線抓 PDH/PDL (多抓幾天以免遇到假日)
-        daily_df = yf.download(ticker, start=start - timedelta(days=10), end=end + timedelta(days=1), interval="1d")
-        # 抓取 5 分鐘線
-        m5_df = yf.download(ticker, start=start, end=end + timedelta(days=1), interval="5m")
-        
-        if m5_df.empty or daily_df.empty:
-            return None, None
+def load_data(ticker, days):
+    # yfinance 1h 數據最高支援 730 天
+    data = yf.download(ticker, period=f"{days}d", interval="1h")
+    data.dropna(inplace=True)
+    return data
+
+data = load_data(selected_asset, days_to_fetch)
+
+# --- 回測邏輯實作 ---
+def run_backtest(df):
+    trades =[]
+    
+    # 確保索引為時區感知或無時區
+    df['Date_Only'] = df.index.date
+    grouped = df.groupby('Date_Only')
+    
+    for date, group in grouped:
+        if len(group) < 8: # 確保一天有足夠的 K 棒 (至少 4H基準 + 後續走勢)
+            continue
             
-        # 轉換時區為美東時間 (紐約)
-        ny_tz = pytz.timezone('America/New_York')
-        m5_df.index = m5_df.index.tz_convert(ny_tz) if m5_df.index.tzinfo else m5_df.index.tz_localize('UTC').tz_convert(ny_tz)
-        daily_df.index = daily_df.index.tz_convert(ny_tz) if daily_df.index.tzinfo else daily_df.index.tz_localize('UTC').tz_convert(ny_tz)
+        # 取前 4 根 1H K 棒組合成「4H基準 K 棒」
+        ref_candle = group.iloc[:4]
+        trading_session = group.iloc[4:]
         
-        # 處理 multi-index columns (yfinance 新版的問題)
-        if isinstance(m5_df.columns, pd.MultiIndex):
-            m5_df.columns = m5_df.columns.droplevel(1)
-        if isinstance(daily_df.columns, pd.MultiIndex):
-            daily_df.columns = daily_df.columns.droplevel(1)
-
-        return daily_df, m5_df
-    except Exception as e:
-        st.error(f"獲取資料時發生錯誤: {e}")
-        return None, None
-
-daily_data, m5_data = load_data(ticker_symbol, start_date, end_date)
-
-if m5_data is None:
-    st.error("無法獲取資料，請檢查日期範圍或網路連線。")
-    st.stop()
-
-# --- 策略回測運算 ---
-trades =[]
-unique_days = pd.Series(m5_data.index.date).unique()
-
-for current_day in unique_days:
-    # 找前一天的日線資料 (PDH, PDL)
-    past_daily = daily_data[daily_data.index.date < current_day]
-    if past_daily.empty:
-        continue
-    prev_day_data = past_daily.iloc[-1]
-    pdh = prev_day_data['High']
-    pdl = prev_day_data['Low']
-    
-    # 擷取當天的 5分K
-    day_m5 = m5_data[m5_data.index.date == current_day]
-    
-    # 尋找 9:30 AM 的第一根 K 棒
-    open_candle = day_m5[(day_m5.index.hour == 9) & (day_m5.index.minute == 30)]
-    if open_candle.empty:
-        continue
-    
-    first_5m_h = float(open_candle['High'].iloc[0])
-    first_5m_l = float(open_candle['Low'].iloc[0])
-    
-    # 狀態追蹤
-    trade_active = False
-    broken_up = False
-    broken_down = False
-    
-    entry_price = 0
-    sl = 0
-    tp = 0
-    trade_type = ""
-    entry_time = None
-    
-    # 迴圈檢查當天後續的 K 棒
-    for idx, candle in day_m5.iterrows():
-        # 如果超過 11:00 AM 且還沒進場，則今天放棄
-        if idx.time() > pd.to_datetime('11:00').time() and not trade_active:
-            break
-            
-        c_high = float(candle['High'])
-        c_low = float(candle['Low'])
+        ref_open = ref_candle['Open'].iloc[0]
+        ref_close = ref_candle['Close'].iloc[-1]
+        ref_high = ref_candle['High'].max()
+        ref_low = ref_candle['Low'].min()
+        ref_range = ref_high - ref_low
         
-        # 1. 檢查突破
-        if not trade_active:
-            if c_high > first_5m_h and not broken_up:
-                broken_up = True
-            elif c_low < first_5m_l and not broken_down:
-                broken_down = True
-                
-            # 2. 檢查回測並進場 (這裡簡化為碰到點位即進場)
-            # 做多：已突破上緣，且價格回踩至 5m_h 附近或以下
-            if broken_up and c_low <= first_5m_h and idx.time() > pd.to_datetime('09:35').time():
-                trade_active = True
-                trade_type = "Long"
-                entry_price = first_5m_h
-                sl = first_5m_l
-                # 止盈邏輯：如果 PDH 太近或在進場點之下，改用 2R (1:2 盈虧比)
-                risk = entry_price - sl
-                tp = pdh if pdh > (entry_price + risk) else entry_price + (risk * 2)
-                entry_time = idx
-                
-            # 做空：已跌破下緣，且價格反彈至 5m_l 附近或以上
-            elif broken_down and c_high >= first_5m_l and idx.time() > pd.to_datetime('09:35').time():
-                trade_active = True
-                trade_type = "Short"
-                entry_price = first_5m_l
-                sl = first_5m_h
-                risk = sl - entry_price
-                tp = pdl if pdl < (entry_price - risk) else entry_price - (risk * 2)
-                entry_time = idx
-                
-        # 3. 若已進場，檢查是否打到止盈或止損
-        else:
-            exit_time = idx
-            result = ""
-            pnl = 0
-            
-            if trade_type == "Long":
-                if c_low <= sl:
-                    result = "Loss (打到止損)"
-                    pnl = -1 # 假設風險為 1R (虧損1單位)
-                elif c_high >= tp:
-                    result = "Win (打到止盈)"
-                    pnl = (tp - entry_price) / (entry_price - sl) # 獲利 R 數
-            elif trade_type == "Short":
-                if c_high >= sl:
-                    result = "Loss (打到止損)"
-                    pnl = -1
-                elif c_low <= tp:
-                    result = "Win (打到止盈)"
-                    pnl = (entry_price - tp) / (sl - entry_price)
+        if ref_range == 0: continue
+        
+        # 判斷方向
+        bias = "Bullish" if ref_close > ref_open else "Bearish"
+        
+        # 計算區間
+        level_25 = ref_high - (ref_range * 0.25)
+        level_50 = ref_high - (ref_range * 0.50)
+        level_75 = ref_high - (ref_range * 0.75)
+        
+        entry_price = None
+        sl_price = None
+        tp_price = None
+        trade_status = "Missed" # Missed, TP, SL
+        exit_time = None
+        pnl = 0
+        
+        for idx, row in trading_session.iterrows():
+            # 還沒進場，尋找進場點
+            if entry_price is None:
+                if bias == "Bullish":
+                    # 價格回撤進入 25% ~ 50% 區間
+                    if row['Low'] <= level_25 and row['High'] >= level_50:
+                        entry_price = level_25 # 假設觸碰到 25% 邊界就進場
+                        sl_price = level_75
+                        tp_price = entry_price + (entry_price - sl_price) * 2 # 1:2 RR
+                elif bias == "Bearish":
+                    # 價格反彈進入底部算起 25%~50% (即從上往下看的 50%~75%)
+                    # 轉換為 Bearish 視角：Optimum 是從 Low 往上的 25%~50%
+                    bear_level_25 = ref_low + (ref_range * 0.25)
+                    bear_level_50 = ref_low + (ref_range * 0.50)
+                    bear_level_75 = ref_low + (ref_range * 0.75)
                     
-            if result:
-                trades.append({
-                    "Date": current_day,
-                    "Type": trade_type,
-                    "Entry Time": entry_time.strftime("%H:%M"),
-                    "Entry Price": round(entry_price, 2),
-                    "TP (止盈)": round(tp, 2),
-                    "SL (止損)": round(sl, 2),
-                    "Exit Time": exit_time.strftime("%H:%M"),
-                    "Result": result,
-                    "PnL (R)": round(pnl, 2),
-                    "5m_H": round(first_5m_h, 2),
-                    "5m_L": round(first_5m_l, 2),
-                    "PDH": round(pdh, 2),
-                    "PDL": round(pdl, 2)
-                })
-                break # 一天只做一單結束
+                    if row['High'] >= bear_level_25 and row['Low'] <= bear_level_50:
+                        entry_price = bear_level_25
+                        sl_price = bear_level_75
+                        tp_price = entry_price - (sl_price - entry_price) * 2 # 1:2 RR
+                        
+            # 已經進場，檢查止盈或止損
+            else:
+                if bias == "Bullish":
+                    if row['Low'] <= sl_price:
+                        trade_status = "Hit SL"
+                        exit_time = idx
+                        pnl = -1 # 用 R 為單位 (損失 1R)
+                        break
+                    elif row['High'] >= tp_price:
+                        trade_status = "Hit TP"
+                        exit_time = idx
+                        pnl = 2 # 獲利 2R
+                        break
+                elif bias == "Bearish":
+                    if row['High'] >= sl_price:
+                        trade_status = "Hit SL"
+                        exit_time = idx
+                        pnl = -1
+                        break
+                    elif row['Low'] <= tp_price:
+                        trade_status = "Hit TP"
+                        exit_time = idx
+                        pnl = 2
+                        break
+                        
+        if entry_price is not None:
+            trades.append({
+                "Date": date,
+                "Bias": bias,
+                "Entry Time": trading_session.index[0], # 簡化顯示
+                "Exit Time": exit_time if exit_time else "End of Day",
+                "Entry Price": round(float(entry_price), 2),
+                "SL": round(float(sl_price), 2),
+                "TP": round(float(tp_price), 2),
+                "Outcome": trade_status if exit_time else "Closed at EOD",
+                "PnL (R)": pnl
+            })
+            
+    return pd.DataFrame(trades)
 
-trades_df = pd.DataFrame(trades)
+st.write("### ⏳ 正在計算回測結果...")
+if not data.empty:
+    trades_df = run_backtest(data)
+    
+    if not trades_df.empty:
+        # --- 計算統計數據 ---
+        total_trades = len(trades_df)
+        wins = len(trades_df[trades_df['Outcome'] == 'Hit TP'])
+        losses = len(trades_df[trades_df['Outcome'] == 'Hit SL'])
+        total_pnl = trades_df['PnL (R)'].sum()
+        win_rate = (wins / (wins + losses)) * 100 if (wins + losses) > 0 else 0
+        
+        # --- 顯示指標看板 ---
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("總交易次數", total_trades)
+        col2.metric("勝率 (僅計 SL/TP)", f"{win_rate:.2f}%")
+        col3.metric("總盈虧 (單位: R)", f"{total_pnl} R")
+        col4.metric("目前市場趨勢", trades_df.iloc[-1]['Bias'])
 
-# --- 顯示結果與表格 ---
-st.subheader("📊 回測結果與交易紀錄")
-if not trades_df.empty:
-    total_trades = len(trades_df)
-    winning_trades = len(trades_df[trades_df["PnL (R)"] > 0])
-    win_rate = winning_trades / total_trades * 100
-    total_pnl = trades_df["PnL (R)"].sum()
-    
-    col1, col2, col3 = st.columns(3)
-    col1.metric("總交易次數", total_trades)
-    col2.metric("勝率", f"{win_rate:.1f}%")
-    col3.metric("總盈虧加總 (Risk Multiples)", f"{total_pnl:.2f} R")
-    
-    # 顯示 DataFrame 表格
-    st.dataframe(trades_df[["Date", "Type", "Entry Time", "Entry Price", "TP (止盈)", "SL (止損)", "Exit Time", "Result", "PnL (R)"]], use_container_width=True)
-    
-    # --- 互動式圖表繪製 ---
-    st.subheader("📈 交易圖表可視化")
-    selected_date = st.selectbox("選擇有發生交易的日期來檢視圖表：", trades_df["Date"])
-    
-    day_trade_info = trades_df[trades_df["Date"] == selected_date].iloc[0]
-    plot_df = m5_data[m5_data.index.date == selected_date]
-    
-    fig = plotly_go.Figure(data=[plotly_go.Candlestick(x=plot_df.index,
-                    open=plot_df['Open'], high=plot_df['High'],
-                    low=plot_df['Low'], close=plot_df['Close'], name="5m K棒")])
-    
-    # 畫出 PDH, PDL, 5m_H, 5m_L, TP, SL 參考線
-    fig.add_hline(y=day_trade_info["PDH"], line_dash="dot", line_color="blue", annotation_text="PDH (前高)")
-    fig.add_hline(y=day_trade_info["PDL"], line_dash="dot", line_color="blue", annotation_text="PDL (前低)")
-    fig.add_hline(y=day_trade_info["5m_H"], line_dash="dash", line_color="orange", annotation_text="9:30 5m High")
-    fig.add_hline(y=day_trade_info["5m_L"], line_dash="dash", line_color="purple", annotation_text="9:30 5m Low")
-    
-    # 標示進場與止盈損
-    fig.add_hline(y=day_trade_info["Entry Price"], line_color="white", annotation_text=f"Entry ({day_trade_info['Type']})")
-    fig.add_hline(y=day_trade_info["TP (止盈)"], line_color="green", annotation_text="TP (止盈)")
-    fig.add_hline(y=day_trade_info["SL (止損)"], line_color="red", annotation_text="SL (止損)")
-    
-    # 美化圖表
-    fig.update_layout(
-        title=f"{ticker_symbol} - {selected_date} 交易訊號圖表",
-        yaxis_title="Price",
-        xaxis_title="Time (EST)",
-        xaxis_rangeslider_visible=False,
-        height=600,
-        template="plotly_dark"
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
+        # --- 繪製最新交易圖表 ---
+        st.write("---")
+        st.write("### 📊 最新交易視覺化 (最後一筆進場交易)")
+        
+        last_trade_date = trades_df.iloc[-1]['Date']
+        # 抓取那天的數據來畫圖
+        chart_data = data[data.index.date == last_trade_date]
+        
+        fig = go.Figure(data=[go.Candlestick(x=chart_data.index,
+                        open=chart_data['Open'],
+                        high=chart_data['High'],
+                        low=chart_data['Low'],
+                        close=chart_data['Close'],
+                        name="市場價格")])
+        
+        # 標示出進場、止損、止盈線
+        entry = trades_df.iloc[-1]['Entry Price']
+        sl = trades_df.iloc[-1]['SL']
+        tp = trades_df.iloc[-1]['TP']
+        bias = trades_df.iloc[-1]['Bias']
+        outcome = trades_df.iloc[-1]['Outcome']
+        
+        fig.add_hline(y=entry, line_dash="dash", line_color="blue", annotation_text="Entry 進場點")
+        fig.add_hline(y=sl, line_dash="dash", line_color="red", annotation_text="SL 止損")
+        fig.add_hline(y=tp, line_dash="dash", line_color="green", annotation_text="TP 止盈")
+        
+        # 繪製前 4 小時的背景色區塊 (基準K棒)
+        fig.add_vrect(x0=chart_data.index[0], x1=chart_data.index[3], 
+                      fillcolor="gray", opacity=0.2, layer="below", line_width=0,
+                      annotation_text="4H 基準 K 棒", annotation_position="top left")
+        
+        fig.update_layout(title=f"{selected_asset_name} - {last_trade_date} ({bias}) | 結果: {outcome}",
+                          xaxis_title="時間",
+                          yaxis_title="價格",
+                          height=600,
+                          template="plotly_dark")
+        
+        st.plotly_chart(fig, use_container_width=True)
 
+        # --- 顯示交易表格 ---
+        st.write("---")
+        st.write("### 📝 完整交易紀錄明細")
+        
+        # 美化表格
+        def color_outcome(val):
+            color = '#4CAF50' if val == 'Hit TP' else '#F44336' if val == 'Hit SL' else 'white'
+            return f'color: {color}; font-weight: bold'
+            
+        styled_df = trades_df.style.map(color_outcome, subset=['Outcome'])
+        st.dataframe(styled_df, use_container_width=True)
+
+    else:
+        st.warning("在所選的時間範圍內沒有找到符合策略的交易訊號。")
 else:
-    st.info("所選日期範圍內沒有符合策略邏輯的交易訊號。")
+    st.error("無法獲取數據，請檢查網路連線或稍後再試。")
