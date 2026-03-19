@@ -14,11 +14,11 @@ with st.expander("📖 策略邏輯與圖表說明"):
     * **流動性清掃 (Liquidity Sweep)**：尋找過去 20 根 15分鐘K線的前高或前低。
     * **假突破 (Fakeout)**：當前 M15 K線刺穿前高/前低，但收盤卻收在區間內（留下長引線）。
     * **精準入場 (Sniper Entry)**：切換至 1分鐘圖，當 M1 價格反向突破 M15 的開盤價時立刻進場。
-    * **圖表標示**：
+    * **圖表標示 (顯示 M15 K線)**：
+        * **K線圖**：底圖為 15 分鐘級別，過濾掉 1 分鐘的雜訊。
         * **虛線**：標示出被清掃的「前高/前低」水平位。
         * **半透明圓圈**：標示假突破發生的瞬間。
-        * **紅色區塊**：止損風險區 (Risk)。
-        * **綠色區塊**：止盈獲利區 (Reward)。
+        * **紅色/綠色區塊**：精準標示從 1 分鐘級別進場的點位，直到觸及止損或止盈的區間。
     """)
 
 st.sidebar.header("⚙️ 參數設定")
@@ -68,10 +68,8 @@ def run_strategy(m1, m15, rr):
     trades =[]
     
     for i in range(20, len(m15) - 1):
-        # 獲取過去 20 根 K 線作為尋找前高/前低的區間
         window_df = m15.iloc[i-20:i]
         
-        # 找出前高和前低的數值與發生的時間點
         prev_high = window_df['High'].max()
         prev_high_time = window_df['High'].idxmax()
         
@@ -86,14 +84,12 @@ def run_strategy(m1, m15, rr):
         swept_level = 0
         swept_time = None
         
-        # 判斷作空 Fakeout (向上清掃前高流動性)
         if current_m15['High'] > prev_high and current_m15['Close'] < prev_high:
             sweep_type = 'Short'
             sl_price = current_m15['High']
             swept_level = prev_high
             swept_time = prev_high_time
             
-        # 判斷作多 Fakeout (向下清掃前低流動性)
         elif current_m15['Low'] < prev_low and current_m15['Close'] > prev_low:
             sweep_type = 'Long'
             sl_price = current_m15['Low']
@@ -103,7 +99,7 @@ def run_strategy(m1, m15, rr):
         if sweep_type:
             trigger_time_start = m15.index[i+1]
             trigger_time_end = trigger_time_start + timedelta(minutes=15)
-            fakeout_candle_time = m15.index[i] # 假突破發生的那根 K 棒時間
+            fakeout_candle_time = m15.index[i] 
             
             m1_window = m1[(m1.index >= trigger_time_start) & (m1.index < trigger_time_end)]
             if m1_window.empty: continue
@@ -177,7 +173,7 @@ if m1_data is not None and m15_data is not None:
         display_df['Exit Time'] = display_df['Exit Time'].dt.strftime('%m-%d %H:%M') if not display_df['Exit Time'].isnull().all() else None
         st.dataframe(display_df, use_container_width=True)
         
-        st.subheader("📈 專業交易圖表復盤 (SMC 流動性畫線)")
+        st.subheader("📈 專業交易圖表復盤 (M15 大級別視角)")
         
         trade_options =[f"[{row['Outcome']}] {row['Type']} at {row['Entry Time']} (P&L: {row['P&L (R)']}R)" for idx, row in display_df.iterrows()]
         selected_trade_str = st.selectbox("選擇交易進行可視化", trade_options)
@@ -185,26 +181,27 @@ if m1_data is not None and m15_data is not None:
         selected_idx = trade_options.index(selected_trade_str)
         trade = trades_df.iloc[selected_idx]
         
-        # 繪圖區間：包含前高/前低的時間點，一直到出場後 60 分鐘
-        start_plot = trade['Swept Time'] - timedelta(minutes=30)
-        end_plot = trade['Exit Time'] + timedelta(minutes=60) if pd.notna(trade['Exit Time']) else trade['Entry Time'] + timedelta(minutes=120)
+        # 繪圖區間：為配合 15 分鐘圖，前後多抓幾個小時確保 K 線數量足夠
+        start_plot = trade['Swept Time'] - timedelta(minutes=120)
+        end_plot = trade['Exit Time'] + timedelta(minutes=180) if pd.notna(trade['Exit Time']) else trade['Entry Time'] + timedelta(minutes=240)
         
-        plot_df = m1_data[(m1_data.index >= start_plot) & (m1_data.index <= end_plot)]
+        # 🌟 修改核心：繪圖資料源改用 m15_data
+        plot_m15 = m15_data[(m15_data.index >= start_plot) & (m15_data.index <= end_plot)]
         
-        fig = go.Figure(data=[go.Candlestick(x=plot_df.index,
-                        open=plot_df['Open'], high=plot_df['High'],
-                        low=plot_df['Low'], close=plot_df['Close'],
-                        name="1M K線", increasing_line_color='lightgray', decreasing_line_color='gray')])
+        fig = go.Figure(data=[go.Candlestick(x=plot_m15.index,
+                        open=plot_m15['Open'], high=plot_m15['High'],
+                        low=plot_m15['Low'], close=plot_m15['Close'],
+                        name="15M K線", increasing_line_color='lightgray', decreasing_line_color='gray')])
         
         # 1. 繪製前高/前低的水平虛線 (Liquidity Line)
         fig.add_shape(type="line", x0=trade['Swept Time'], y0=trade['Swept Level'], x1=end_plot, y1=trade['Swept Level'],
                       line=dict(color="rgba(200, 200, 200, 0.6)", width=1, dash="dot"))
         fig.add_annotation(x=trade['Swept Time'], y=trade['Swept Level'], text="Prev M15 H/L", showarrow=False, yshift=10, font=dict(color="white"))
 
-        # 2. 繪製清掃標記 (半透明圓圈，符合截圖效果)
+        # 2. 繪製清掃標記 (半透明圓圈，放在假突破的 M15 蠟燭中心)
         circle_color = "rgba(255, 50, 50, 0.4)" if trade['Type'] == 'Short' else "rgba(50, 255, 50, 0.4)"
         fig.add_trace(go.Scatter(
-            x=[trade['Fakeout Time'] + timedelta(minutes=7)], # 圓圈放在假突破K棒中間
+            x=[trade['Fakeout Time'] + timedelta(minutes=7.5)], # 調整到15分K棒中間
             y=[trade['Swept Level']],
             mode='markers', marker=dict(size=25, color=circle_color, line=dict(width=0)),
             name='Liquidity Sweep (清掃)'
@@ -221,18 +218,21 @@ if m1_data is not None and m15_data is not None:
         fig.add_shape(type="rect", x0=trade['Entry Time'], y0=trade['Entry Price'], x1=exit_time_plot, y1=trade['TP'],
                       fillcolor="rgba(0, 150, 255, 0.15)", line_width=0, layer="below")
 
-        # 4. 標示精準進場點
+        # 4. 標示 1分鐘 級別的精準進場點 (掛在 M15 圖表上)
         fig.add_trace(go.Scatter(
             x=[trade['Entry Time']], y=[trade['Entry Price']],
             mode='markers+text', marker=dict(size=10, symbol='triangle-right', color='white'),
-            text=["Entry"], textposition="middle right", name='Entry'
+            text=["Entry (M1)"], textposition="middle right", name='M1 Entry'
         ))
         
         fig.update_layout(
             title=f"復盤: {trade['Type']} 交易於 {trade['Entry Time'].strftime('%m-%d %H:%M')}",
             yaxis_title='價格', xaxis_title='時間',
             template='plotly_dark', xaxis_rangeslider_visible=False, height=650,
-            plot_bgcolor='#131722', paper_bgcolor='#131722' # 採用 TradingView 暗色系背景
+            plot_bgcolor='#131722', paper_bgcolor='#131722' # TradingView 暗黑風格
         )
+        
+        # 強制 X 軸為時間連續格式，以免跨日/跨週末時斷線或排版跑掉
+        fig.update_xaxes(type='date')
         
         st.plotly_chart(fig, use_container_width=True)
