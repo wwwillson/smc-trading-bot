@@ -4,14 +4,15 @@ import plotly.graph_objects as go
 from datetime import datetime
 import pytz
 import requests
+import time
 
 # 設定網頁佈局
-st.set_page_config(page_title="NY Session Trading Strategy", layout="wide")
+st.set_page_config(page_title="NY Session Trading Strategy 1-Year Backtest", layout="wide")
 
-st.title("📈 紐約盤開盤突破 (NY ORB) 交易與回測系統")
+st.title("📈 紐約盤開盤突破 (NY ORB) 1年回測系統")
 st.markdown("""
-- **100% 免費 & 免 API Key**：利用幣安全球公開節點獲取 BTC、黃金代幣(PAXG)、歐元(EUR)。
-- **自動回測系統**：自動抓取過去 3 個月歷史資料，判定進場後是否順利達到 1.5R 止盈或是打到止損。
+- **1年期量化回測**：自動抓取過去 365 天 (約 10 萬根 5m K線) 數據，計算真實的 Risk Reward (R) 期望值。
+- **防封鎖下載機制**：加入智能延遲與進度條，安全繞過 API 請求限制。
 """)
 
 # 側邊欄設定
@@ -25,38 +26,60 @@ asset_dict = {
 selected_asset = st.sidebar.selectbox("選擇交易標的", list(asset_dict.keys()))
 ticker = asset_dict[selected_asset]
 
-# --- 數據獲取函數 (利用迴圈抓取長達 3 個月的資料) ---
+# 讓使用者可以自由選擇要回測的天數，預設 365 天
+backtest_days = st.sidebar.slider("選擇回測天數", min_value=30, max_value=365, value=365, step=30)
+
+# --- 數據獲取函數 (利用迴圈抓取長達 1 年的資料) ---
 @st.cache_data(ttl=3600)
-def load_historical_data(symbol, days=90):
+def load_historical_data(symbol, days):
     end_time = int(datetime.now().timestamp() * 1000)
     start_time = end_time - (days * 24 * 60 * 60 * 1000)
     all_data =[]
     
-    # 幣安免翻牆公開資料庫，不封鎖雲端主機
+    # 幣安免翻牆公開資料庫
     url = "https://data-api.binance.vision/api/v3/klines"
     
-    with st.spinner(f'正在獲取 {selected_asset} 近 {days} 天歷史數據 (可能需要幾秒鐘)...'):
-        while start_time < end_time:
-            params = {
-                "symbol": symbol,
-                "interval": "5m",
-                "limit": 1000,
-                "startTime": start_time,
-                "endTime": end_time
-            }
-            try:
-                res = requests.get(url, params=params, timeout=10)
-                if res.status_code == 200:
-                    data = res.json()
-                    if not data:
-                        break
-                    all_data.extend(data)
-                    # 將下一次抓取的起始時間設為最後一根 K 線時間 + 1 毫秒
-                    start_time = data[-1][0] + 1
-                else:
+    # 計算大約需要發送幾次 API 請求 (每天288根K線，每次最多抓1000根)
+    total_requests = int((days * 288) / 1000) + 1
+    req_count = 0
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    while start_time < end_time:
+        params = {
+            "symbol": symbol,
+            "interval": "5m",
+            "limit": 1000,
+            "startTime": start_time,
+            "endTime": end_time
+        }
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if not data:
                     break
-            except Exception:
+                all_data.extend(data)
+                
+                # 更新下一次抓取的時間戳記
+                start_time = data[-1][0] + 1
+                
+                # 更新進度條
+                req_count += 1
+                progress = min(req_count / total_requests, 1.0)
+                progress_bar.progress(progress)
+                status_text.text(f"正在下載 {selected_asset} 歷史數據... 處理進度: {int(progress*100)}% (請稍候約10-20秒)")
+                
+                # 加入 0.1 秒延遲，防止被幣安 API 封鎖 (Rate Limit)
+                time.sleep(0.1)
+            else:
                 break
+        except Exception:
+            break
+
+    progress_bar.empty()
+    status_text.empty()
 
     if not all_data:
         return pd.DataFrame()
@@ -73,15 +96,15 @@ def load_historical_data(symbol, days=90):
     df = df[~df.index.duplicated(keep='first')] # 移除重複值
     return df
 
-# 載入近 90 天資料
-df = load_historical_data(ticker, days=90)
+# 載入歷史資料
+df = load_historical_data(ticker, days=backtest_days)
 
 if df.empty:
     st.error("❌ 獲取數據失敗，請確認網路連線。")
     st.stop()
 
 # --- 建立 UI 兩個分頁 ---
-tab1, tab2 = st.tabs(["📊 即時交易圖表 (單日)", "📋 近三個月回測報告 (自動判定)"])
+tab1, tab2 = st.tabs([f"📊 即時交易圖表 (單日)", f"📋 近 {backtest_days} 天回測報告 (自動判定)"])
 
 # ==========================================
 # 分頁 1: 即時圖表邏輯
@@ -155,10 +178,11 @@ with tab1:
     st.plotly_chart(fig, use_container_width=True)
 
 # ==========================================
-# 分頁 2: 90 天自動回測與盈虧判定表
+# 分頁 2: 大數據自動回測與盈虧判定表
 # ==========================================
 with tab2:
-    st.subheader(f"📊 {selected_asset} 近三個月 (90天) 回測報告")
+    st.subheader(f"📊 {selected_asset} 近 {backtest_days} 天回測報告")
+    st.caption("回測邏輯：09:45確立區間後，突破做多跌破做空，止盈為 1.5 倍風險(R)，止損為區間另一端。若至美東時間 16:00 皆未觸碰止盈止損，則無條件收盤平倉。")
     
     results =[]
     dates = pd.Series(df.index.date).unique()
@@ -172,12 +196,16 @@ with tab2:
         ny_end = datetime.combine(d, datetime.strptime("16:00", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
         
         df_orb = df_d[(df_d.index >= orb_s) & (df_d.index < orb_e)]
-        if len(df_orb) < 3: # 無完整 ORB 數據則跳過
+        if len(df_orb) < 3: # 無完整 ORB 數據則跳過 (可能當天週末沒開盤或缺漏)
             continue
             
         o_high = df_orb['High'].max()
         o_low = df_orb['Low'].min()
         
+        # 避免最高點等於最低點導致除以0的錯誤
+        if o_high == o_low:
+            continue
+            
         df_post = df_d[(df_d.index >= orb_e) & (df_d.index <= ny_end)]
         
         entered = False
@@ -215,7 +243,7 @@ with tab2:
                     elif e_row['High'] >= tp: # 打到止盈
                         outcome, ex_price, ex_time, pnl = "🟢 獲利 (打到止盈)", tp, e_idx, 1.5
                         break
-                else:
+                else: # 做空邏輯
                     if e_row['High'] >= sl:
                         outcome, ex_price, ex_time, pnl = "🔴 虧損 (打到止損)", sl, e_idx, -1.0
                         break
@@ -232,7 +260,7 @@ with tab2:
                 else:
                     pnl = (e_price - ex_price) / (sl - e_price)
                 
-                outcome = "🟢 獲利 (收盤平倉)" if pnl > 0 else "🔴 虧損 (收盤平倉)"
+                outcome = "🟢 獲利 (時間到平倉)" if pnl > 0 else "🔴 虧損 (時間到平倉)"
 
             results.append({
                 "日期": str(d),
@@ -251,6 +279,9 @@ with tab2:
     if results:
         df_results = pd.DataFrame(results)
         
+        # 按照日期由新到舊排序
+        df_results = df_results.sort_values(by="日期", ascending=False).reset_index(drop=True)
+        
         # 計算統計數據
         total_trades = len(df_results)
         wins = len(df_results[df_results['盈虧 (R)'] > 0])
@@ -258,9 +289,9 @@ with tab2:
         net_r = df_results['盈虧 (R)'].sum()
         
         col1, col2, col3 = st.columns(3)
-        col1.metric("總交易次數", f"{total_trades} 次")
+        col1.metric("1年內總進場次數", f"{total_trades} 次")
         col2.metric("總勝率 (Win Rate)", f"{win_rate:.1f} %")
-        col3.metric("總淨盈虧 (Risk Reward)", f"{net_r:.2f} R")
+        col3.metric("總淨利期望值 (Total Risk Reward)", f"{net_r:.2f} R")
         
         # 標色顯示表格
         def color_outcome(val):
@@ -270,4 +301,4 @@ with tab2:
             
         st.dataframe(df_results.style.map(color_outcome, subset=['結果']), height=600, use_container_width=True)
     else:
-        st.info("過去 3 個月內無符合交易條件的紀錄。")
+        st.info(f"過去 {backtest_days} 天內無符合交易條件的紀錄。")
