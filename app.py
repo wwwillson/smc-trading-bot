@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # 設定網頁配置
 st.set_page_config(page_title="SMC 量化交易策略儀表板", layout="wide")
@@ -20,7 +19,7 @@ st.sidebar.title("⚙️ 交易參數設定")
 selected_asset = st.sidebar.selectbox("選擇交易商品", list(TICKERS.keys()))
 ticker_symbol = TICKERS[selected_asset]
 
-timeframe = st.sidebar.selectbox("選擇時間級別", ["15m", "1h", "4h", "1d"], index=2)
+timeframe = st.sidebar.selectbox("選擇時間級別",["15m", "1h", "4h", "1d"], index=2)
 period = st.sidebar.selectbox("載入歷史資料長度",["5d", "1mo", "3mo", "1y"], index=1)
 
 rr_ratio = st.sidebar.slider("設定盈虧比 (Risk:Reward)", min_value=1.0, max_value=5.0, value=2.0, step=0.1)
@@ -38,7 +37,13 @@ st.sidebar.markdown("""
 
 @st.cache_data
 def load_data(ticker, period, interval):
+    # 下載歷史數據
     df = yf.download(ticker, period=period, interval=interval)
+    
+    # 🌟【修復關鍵】: 檢查並攤平多層級的 Columns (處理新版 yfinance 格式變更的問題)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+        
     df.dropna(inplace=True)
     return df
 
@@ -75,28 +80,34 @@ def calculate_strategy(df, rr_ratio):
     df['SL'] = np.nan
     df['TP'] = np.nan
 
+    # 使用 index 迭代避免 Warning
+    signal_idx = df.columns.get_loc('Signal')
+    entry_idx = df.columns.get_loc('Entry_Price')
+    sl_idx = df.columns.get_loc('SL')
+    tp_idx = df.columns.get_loc('TP')
+
     for i in range(1, len(df)):
         # 條件：多頭趨勢回調 (價格在均線區間附近，且 EMA20 > EMA50)
         if df['EMA_20'].iloc[i] > df['EMA_50'].iloc[i]:
             if df['Bullish_Engulfing'].iloc[i] and (df['Low'].iloc[i] <= df['EMA_20'].iloc[i]):
-                df.iat[i, df.columns.get_loc('Signal')] = 1
-                entry = df['Close'].iloc[i]
-                sl = df['Low'].iloc[i] - (df['ATR'].iloc[i] * 0.5) # 止損設在K線低點加一點緩衝
-                tp = entry + ((entry - sl) * rr_ratio) # 依據盈虧比計算止盈
-                df.iat[i, df.columns.get_loc('Entry_Price')] = entry
-                df.iat[i, df.columns.get_loc('SL')] = sl
-                df.iat[i, df.columns.get_loc('TP')] = tp
+                df.iat[i, signal_idx] = 1
+                entry = float(df['Close'].iloc[i])
+                sl = float(df['Low'].iloc[i] - (df['ATR'].iloc[i] * 0.5)) # 止損設在K線低點加一點緩衝
+                tp = float(entry + ((entry - sl) * rr_ratio)) # 依據盈虧比計算止盈
+                df.iat[i, entry_idx] = entry
+                df.iat[i, sl_idx] = sl
+                df.iat[i, tp_idx] = tp
 
         # 條件：空頭趨勢回調 (價格在均線區間附近，且 EMA20 < EMA50)
         elif df['EMA_20'].iloc[i] < df['EMA_50'].iloc[i]:
             if df['Bearish_Engulfing'].iloc[i] and (df['High'].iloc[i] >= df['EMA_20'].iloc[i]):
-                df.iat[i, df.columns.get_loc('Signal')] = -1
-                entry = df['Close'].iloc[i]
-                sl = df['High'].iloc[i] + (df['ATR'].iloc[i] * 0.5)
-                tp = entry - ((sl - entry) * rr_ratio)
-                df.iat[i, df.columns.get_loc('Entry_Price')] = entry
-                df.iat[i, df.columns.get_loc('SL')] = sl
-                df.iat[i, df.columns.get_loc('TP')] = tp
+                df.iat[i, signal_idx] = -1
+                entry = float(df['Close'].iloc[i])
+                sl = float(df['High'].iloc[i] + (df['ATR'].iloc[i] * 0.5))
+                tp = float(entry - ((sl - entry) * rr_ratio))
+                df.iat[i, entry_idx] = entry
+                df.iat[i, sl_idx] = sl
+                df.iat[i, tp_idx] = tp
 
     return df
 
@@ -140,9 +151,9 @@ recent_signals = df[df['Signal'] != 0]
 if not recent_signals.empty:
     last_signal = recent_signals.iloc[-1]
     last_idx = recent_signals.index[-1]
-    entry = last_signal['Entry_Price']
-    sl = last_signal['SL']
-    tp = last_signal['TP']
+    entry = float(last_signal['Entry_Price'])
+    sl = float(last_signal['SL'])
+    tp = float(last_signal['TP'])
     signal_type = "買入 (Long)" if last_signal['Signal'] == 1 else "賣出 (Short)"
     
     st.success(f"🚨 **最新訊號提示:** 於 {last_idx.strftime('%Y-%m-%d %H:%M')} 出現 **{signal_type}** 訊號！\n"
