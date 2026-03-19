@@ -37,19 +37,13 @@ days_to_fetch = st.sidebar.slider("載入最近天數的數據", min_value=1, ma
 # 獲取數據 (使用 5 分鐘 K 線)
 @st.cache_data(ttl=300)
 def load_data(ticker, days):
-    # 建立自訂的 Session 偽裝成瀏覽器，避免被 Yahoo 阻擋
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    })
-    
-    # 抓取數據，並傳入我們自訂的 session
-    data = yf.download(ticker, period=f"{days}d", interval="5m", session=session)
+    # 🚨 移除自訂 Session，讓 yfinance 預設的 curl_cffi 引擎自動處理反爬蟲
+    data = yf.download(ticker, period=f"{days}d", interval="5m")
     
     if data.empty:
         return data
     
-    # 處理 multi-index columns (yfinance 新版有時候會有)
+    # 處理 multi-index columns (yfinance 新版回傳格式處理)
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.droplevel(1)
         
