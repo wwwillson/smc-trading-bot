@@ -10,21 +10,16 @@ st.set_page_config(page_title="NY Session Trading Strategy", layout="wide")
 
 st.title("📈 紐約盤開盤突破 (NY ORB) 交易機器人")
 st.markdown("""
-### 解決了 Yahoo 封鎖問題的新版本 🚀
-- **加密貨幣 (BTC/ETH)**：使用 Binance 公開 API，**無須 API Key，永久免費穩定**。
-- **傳統金融 (Gold/EUR)**：使用 Twelve Data API，需在左側輸入免費 API Key。
----
-**交易邏輯 (參考影片策略)**
-1. **亞洲盤/倫敦盤**: 建立並清掃流動性。
-2. **紐約開盤區間 (NY ORB)**: 標記美東時間 **09:30 - 09:45** 的高低點。
-3. **進場條件**: 價格突破該區間，模擬進場，並設定 **1.5 倍盈虧比 (Risk-Reward)** 的止損與止盈。
+### 穩定版：支援雲端部署與本地端 🚀
+- **加密貨幣 (BTC/ETH)**：使用 **Bybit 公開 API**，無須 API Key，不阻擋雲端 IP。
+- **傳統金融 (Gold/EUR)**：使用 **Twelve Data API**，需在左側輸入免費 API Key。
 """)
 
 # 側邊欄設定
 st.sidebar.header("⚙️ 交易設定")
-data_source = st.sidebar.radio("選擇市場",["🟢 加密貨幣 (Binance 免費數據)", "🟡 外匯與黃金 (需 API Key)"])
+data_source = st.sidebar.radio("選擇市場",["🟢 加密貨幣 (Bybit 免費數據)", "🟡 外匯與黃金 (需 API Key)"])
 
-if data_source == "🟢 加密貨幣 (Binance 免費數據)":
+if data_source == "🟢 加密貨幣 (Bybit 免費數據)":
     asset_dict = {
         "Bitcoin (BTC/USDT)": "BTCUSDT",
         "Ethereum (ETH/USDT)": "ETHUSDT",
@@ -47,45 +42,69 @@ days_to_fetch = st.sidebar.slider("載入最近天數", min_value=1, max_value=3
 
 # --- 數據獲取函數 (快取 5 分鐘) ---
 @st.cache_data(ttl=300)
-def load_binance_data(symbol, days):
-    limit = min(days * 288, 1000) # 5m K線每天288根，API最多支援1000根
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit={limit}"
-    res = requests.get(url)
-    if res.status_code != 200:
+def load_crypto_data(symbol, days):
+    limit = min(days * 288, 1000) # 5m K線每天288根，Bybit最多1000根
+    url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval=5&limit={limit}"
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            st.error(f"連線失敗！Bybit API 錯誤碼: {res.status_code}")
+            return None
+        
+        data = res.json()
+        if data['retCode'] != 0:
+            st.error(f"Bybit API 拒絕請求: {data['retMsg']}")
+            return None
+            
+        # Bybit 回傳的是由新到舊的陣列
+        kline_list = data['result']['list']
+        df = pd.DataFrame(kline_list, columns=['datetime', 'Open', 'High', 'Low', 'Close', 'Volume', 'Turnover'])
+        
+        # 轉換時間戳記 (毫秒 -> datetime)
+        df['datetime'] = pd.to_numeric(df['datetime'])
+        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+        
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = df[col].astype(float)
+            
+        df.set_index('datetime', inplace=True)
+        df = df.sort_index(ascending=True) # 轉換為由舊到新
+        
+        # 設定為紐約時區
+        df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
+        return df
+    except Exception as e:
+        st.error(f"發生網路異常: {e}")
         return None
-    data = res.json()
-    df = pd.DataFrame(data, columns=['datetime', 'Open', 'High', 'Low', 'Close', 'Volume', '_', '_', '_', '_', '_', '_'])
-    df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
-    df.set_index('datetime', inplace=True)
-    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-        df[col] = df[col].astype(float)
-    # 轉換為紐約時間
-    df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
-    return df
 
 @st.cache_data(ttl=300)
 def load_twelvedata_data(symbol, days, key):
     limit = min(days * 288, 1000)
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize={limit}&timezone=America/New_York&apikey={key}"
-    res = requests.get(url)
-    data = res.json()
-    if 'values' not in data:
-        st.error(f"API 錯誤: {data.get('message', '請確認 API Key 是否正確')}")
+    try:
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        if 'values' not in data:
+            st.error(f"Twelve Data 錯誤: {data.get('message', '無效的 API Key 或請求過於頻繁')}")
+            return None
+        
+        df = pd.DataFrame(data['values'])
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df.set_index('datetime', inplace=True)
+        for col in['open', 'high', 'low', 'close']:
+            df[col] = df[col].astype(float)
+        df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'})
+        df = df.sort_index(ascending=True)
+        df.index = df.index.tz_localize('America/New_York')
+        return df
+    except Exception as e:
+        st.error(f"發生網路異常: {e}")
         return None
-    df = pd.DataFrame(data['values'])
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    df.set_index('datetime', inplace=True)
-    for col in ['open', 'high', 'low', 'close']:
-        df[col] = df[col].astype(float)
-    df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'})
-    df = df.sort_index(ascending=True)
-    df.index = df.index.tz_localize('America/New_York')
-    return df
 
 # --- 載入數據 ---
 with st.spinner('正在從 API 獲取即時數據...'):
-    if data_source == "🟢 加密貨幣 (Binance 免費數據)":
-        df = load_binance_data(ticker, days_to_fetch)
+    if data_source == "🟢 加密貨幣 (Bybit 免費數據)":
+        df = load_crypto_data(ticker, days_to_fetch)
     else:
         if not api_key:
             st.warning("⚠️ 必須在左側側邊欄輸入 Twelve Data API Key 才能載入外匯/黃金數據。")
@@ -93,7 +112,7 @@ with st.spinner('正在從 API 獲取即時數據...'):
         df = load_twelvedata_data(ticker, days_to_fetch, api_key)
 
 if df is None or df.empty:
-    st.error("無法獲取數據，請稍後再試。")
+    st.error("❌ 獲取數據失敗，請查看上方的詳細錯誤訊息。")
     st.stop()
 
 # --- 選擇日期與策略邏輯 ---
@@ -113,7 +132,7 @@ df_orb = df_day[(df_day.index >= orb_start) & (df_day.index < orb_end)]
 
 orb_high = None
 orb_low = None
-signal_msg = "🕒 今日尚未出現符合條件的開盤區間 (09:30-09:45) 數據。"
+signal_msg = "🕒 該日期的美東時間 09:30-09:45 尚未到達，還無法確立開盤區間。"
 trade_signal = None
 
 if not df_orb.empty:
@@ -146,7 +165,7 @@ if not df_orb.empty:
             break
             
     if not trade_signal:
-        signal_msg = "⏳ 今日開盤區間已確立，走勢尚在區間內，等待突破..."
+        signal_msg = "⏳ 今日開盤區間已確立，目前走勢尚在區間內，等待突破..."
 
 # --- 畫面顯示 ---
 st.subheader(f"💡 即時交易訊號 ({selected_date})")
@@ -193,7 +212,7 @@ for start_time, end_time, color, name in session_colors:
     fig.add_vrect(x0=s_time, x1=e_time, fillcolor=color, opacity=1, layer="below", line_width=0, annotation_text=name, annotation_position="top left")
 
 fig.update_layout(
-    title=f"{selected_asset} 走勢圖",
+    title=f"{selected_asset} 走勢圖 (以美東時間顯示)",
     yaxis_title="價格 (USD)", xaxis_title="美東時間 (EST)",
     height=750, xaxis_rangeslider_visible=False, template="plotly_dark"
 )
