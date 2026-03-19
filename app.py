@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import pytz
+import requests
 
 # 設定網頁佈局
 st.set_page_config(page_title="NY Session Trading Strategy", layout="wide")
@@ -36,8 +37,15 @@ days_to_fetch = st.sidebar.slider("載入最近天數的數據", min_value=1, ma
 # 獲取數據 (使用 5 分鐘 K 線)
 @st.cache_data(ttl=300)
 def load_data(ticker, days):
-    # 抓取數據
-    data = yf.download(ticker, period=f"{days}d", interval="5m")
+    # 建立自訂的 Session 偽裝成瀏覽器，避免被 Yahoo 阻擋
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
+    
+    # 抓取數據，並傳入我們自訂的 session
+    data = yf.download(ticker, period=f"{days}d", interval="5m", session=session)
+    
     if data.empty:
         return data
     
@@ -50,6 +58,7 @@ def load_data(ticker, days):
         data.index = data.index.tz_localize('UTC').tz_convert('America/New_York')
     else:
         data.index = data.index.tz_convert('America/New_York')
+        
     return data
 
 df = load_data(ticker, days_to_fetch)
