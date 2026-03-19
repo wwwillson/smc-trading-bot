@@ -2,175 +2,162 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
-import numpy as np
+from datetime import timedelta
 
-# --- 頁面設定 ---
-st.set_page_config(page_title="Sniper Entry 交易訊號系統", layout="wide")
+# 設定網頁版面
+st.set_page_config(page_title="SMC 交易策略視覺化", layout="wide")
 
-# --- 影片交易邏輯說明 ---
-st.title("🎯 狙擊手進場 (Sniper Entry) 交易訊號系統")
-st.markdown("""
-### 🧠 交易邏輯 (參考自影片: How To Find Sniper Entries Everytime)
-本系統根據 SMC (Smart Money Concepts) 打造，專注於 **高盈虧比 (High R:R)** 的交易：
-1. **兩大關鍵位重疊 (Confluence)**：尋找公平價值缺口 (FVG, Imbalance) 與流動性區間 (Swing High/Low) 的重疊點。
-2. **極小止損 (Tight Stop Loss)**：進場後，止損設於關鍵K線的極值之外，不給市場太多容錯空間。
-3. **高盈虧比 (High Reward to Risk)**：目標獲利至少設為 1:3 到 1:10，寧可勝率較低 (如 20-30%)，也要透過高賠率達到長期獲利。
-""")
+# --- UI 與側邊欄設定 ---
+st.title("📈 SMC 交易策略回測與訊號提示 (參考影片邏輯)")
 
-# --- 側邊欄設定 ---
 st.sidebar.header("⚙️ 參數設定")
-assets = {
+asset_dict = {
     "Bitcoin (BTC/USD)": "BTC-USD",
     "Gold (XAU/USD)": "GC=F",
     "Euro (EUR/USD)": "EURUSD=X"
 }
-selected_asset = st.sidebar.selectbox("選擇交易標的", list(assets.keys()))
-ticker = assets[selected_asset]
+asset_choice = st.sidebar.selectbox("選擇交易商品", list(asset_dict.keys()))
+ticker = asset_dict[asset_choice]
 
-timeframe = st.sidebar.selectbox("選擇時間級別",["15m", "30m", "1h", "4h", "1d"], index=2)
-rr_ratio = st.sidebar.slider("盈虧比 (Reward to Risk)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
+tf_choice = st.sidebar.selectbox("選擇時間級別 (Timeframe)", ["1d", "1h", "15m"])
+# 注意：yfinance 的 15m 資料最多只能抓取近 60 天
+days_to_fetch = st.sidebar.slider("載入歷史天數", 5, 60, 30)
 
-# --- 抓取數據 ---
-@st.cache_data(ttl=300) # 快取5分鐘
-def load_data(ticker, interval):
-    # 根據級別決定抓取的天數
-    period = "60d" if interval in ["1h", "4h", "1d"] else "7d"
-    df = yf.download(ticker, period=period, interval=interval)
-    if not df.empty:
-        # yfinance 回傳的多層索引欄位處理
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-        df.reset_index(inplace=True)
-        # 統一時間欄位名稱
-        df.rename(columns={'Datetime': 'Date'}, inplace=True)
-        df.rename(columns={'index': 'Date'}, inplace=True)
+# --- 抓取市場資料 ---
+@st.cache_data(ttl=300)
+def load_data(ticker, interval, days):
+    end_date = pd.Timestamp.now()
+    start_date = end_date - timedelta(days=days)
+    df = yf.download(ticker, start=start_date, end=end_date, interval=interval)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.dropna(inplace=True)
     return df
 
-df = load_data(ticker, timeframe)
+df = load_data(ticker, tf_choice, days_to_fetch)
 
-# --- 核心邏輯：尋找 FVG 與計算進場訊號 ---
-def detect_signals(df, rr):
-    df['FVG_Bullish'] = False
-    df['FVG_Bearish'] = False
-    df['Signal'] = 0 # 1 為做多, -1 為做空
-    df['Entry_Price'] = np.nan
-    df['SL'] = np.nan
-    df['TP'] = np.nan
-
-    # 1. 偵測 FVG (缺口)
-    for i in range(2, len(df)):
-        # 牛市 FVG: 第1根的High < 第3根的Low
-        if df['High'].iloc[i-2] < df['Low'].iloc[i]:
-            df.at[i-1, 'FVG_Bullish'] = True
-        # 熊市 FVG: 第1根的Low > 第3根的High
-        elif df['Low'].iloc[i-2] > df['High'].iloc[i]:
-            df.at[i-1, 'FVG_Bearish'] = True
-
-    # 2. 尋找回踩 FVG 進場點 (簡化版的 Sniper Entry)
-    active_bull_fvg = None
-    active_bear_fvg = None
-
+# --- 影片交易邏輯核心演算法 (SMC FVG & Pullback) ---
+def identify_fvg_and_signals(df):
+    signals = []
+    fvgs =[]
+    
+    # 步驟 4 & 5: 尋找回撤產生的 FVG (合理價值缺口) 作為 Key Level
+    for i in range(1, len(df) - 2):
+        c1 = df.iloc[i-1]
+        c2 = df.iloc[i]
+        c3 = df.iloc[i+1]
+        
+        # 尋找做空缺口 (Bearish FVG) - 伴隨向下結構破壞
+        if c3['High'] < c1['Low'] and c2['Close'] < c2['Open']:
+            fvgs.append({
+                'type': 'Bearish',
+                'start_index': df.index[i+1],
+                'top': c1['Low'],
+                'bottom': c3['High'],
+                'sl': c1['High'], # 止損設為結構高點
+                'active': True
+            })
+            
+        # 尋找做多缺口 (Bullish FVG) - 伴隨向上結構破壞
+        elif c3['Low'] > c1['High'] and c2['Close'] > c2['Open']:
+            fvgs.append({
+                'type': 'Bullish',
+                'start_index': df.index[i+1],
+                'top': c3['Low'],
+                'bottom': c1['High'],
+                'sl': c1['Low'], # 止損設為結構低點
+                'active': True
+            })
+            
+    # 步驟 6: 等待第二次回撤觸發進場 (價格回踩進入 Key Level)
     for i in range(3, len(df)):
-        # 記錄最新的缺口
-        if df['FVG_Bullish'].iloc[i-2]:
-            active_bull_fvg = {'top': df['Low'].iloc[i-1], 'bottom': df['High'].iloc[i-3], 'idx': i-2}
-        if df['FVG_Bearish'].iloc[i-2]:
-            active_bear_fvg = {'top': df['Low'].iloc[i-3], 'bottom': df['High'].iloc[i-1], 'idx': i-2}
+        current_time = df.index[i]
+        row = df.iloc[i]
+        
+        for fvg in fvgs:
+            if not fvg['active'] or current_time <= fvg['start_index']:
+                continue
+                
+            # 做空進場：價格向上回測觸碰到 Bearish FVG 的底部
+            if fvg['type'] == 'Bearish' and row['High'] >= fvg['bottom']:
+                fvg['active'] = False # 觸發後標記失效
+                entry_price = fvg['bottom']
+                sl = fvg['sl']
+                tp = entry_price - (sl - entry_price) * 2 # 固定 1:2 盈虧比
+                signals.append({'time': current_time, 'type': 'Sell', 'entry': entry_price, 'sl': sl, 'tp': tp})
+                
+            # 做多進場：價格向下回測觸碰到 Bullish FVG 的頂部
+            elif fvg['type'] == 'Bullish' and row['Low'] <= fvg['top']:
+                fvg['active'] = False
+                entry_price = fvg['top']
+                sl = fvg['sl']
+                tp = entry_price + (entry_price - sl) * 2 # 固定 1:2 盈虧比
+                signals.append({'time': current_time, 'type': 'Buy', 'entry': entry_price, 'sl': sl, 'tp': tp})
+                
+    return fvgs, signals
 
-        # 做多邏輯：價格跌入 Bullish FVG
-        if active_bull_fvg and df['Low'].iloc[i] <= active_bull_fvg['top'] and df['Close'].iloc[i] > active_bull_fvg['bottom']:
-            entry = df['Close'].iloc[i]
-            sl = active_bull_fvg['bottom'] - (entry * 0.0005) # 止損設在缺口下緣再低一點
-            risk = entry - sl
-            tp = entry + (risk * rr)
-            
-            df.at[i, 'Signal'] = 1
-            df.at[i, 'Entry_Price'] = entry
-            df.at[i, 'SL'] = sl
-            df.at[i, 'TP'] = tp
-            active_bull_fvg = None # 用過即作廢
+fvgs, signals = identify_fvg_and_signals(df)
 
-        # 做空邏輯：價格漲入 Bearish FVG
-        elif active_bear_fvg and df['High'].iloc[i] >= active_bear_fvg['bottom'] and df['Close'].iloc[i] < active_bear_fvg['top']:
-            entry = df['Close'].iloc[i]
-            sl = active_bear_fvg['top'] + (entry * 0.0005) # 止損設在缺口上緣再高一點
-            risk = sl - entry
-            tp = entry - (risk * rr)
+# --- 網頁佈局 ---
+col1, col2 = st.columns([1, 3])
 
-            df.at[i, 'Signal'] = -1
-            df.at[i, 'Entry_Price'] = entry
-            df.at[i, 'SL'] = sl
-            df.at[i, 'TP'] = tp
-            active_bear_fvg = None # 用過即作廢
-
-    return df
-
-if not df.empty:
-    df_signals = detect_signals(df, rr_ratio)
-
-    # --- 最新訊號提示 ---
-    latest_signal = df_signals.iloc[-1]
-    if latest_signal['Signal'] == 1:
-        st.success(f"🟢 **最新狙擊手作多訊號出現！** 價格: {latest_signal['Entry_Price']:.4f} | 止損: {latest_signal['SL']:.4f} | 止盈: {latest_signal['TP']:.4f}")
-    elif latest_signal['Signal'] == -1:
-        st.error(f"🔴 **最新狙擊手作空訊號出現！** 價格: {latest_signal['Entry_Price']:.4f} | 止損: {latest_signal['SL']:.4f} | 止盈: {latest_signal['TP']:.4f}")
+with col1:
+    st.markdown("### 📖 影片完整交易邏輯")
+    st.markdown("""
+    此程式將影片中的 6 個步驟程式化呈現：
+    1. **確認趨勢 (Trend)**: 尋找連續的市場結構破壞 (BOS)。
+    2. **等待弱勢 (Weakness)**: 趨勢末端價格無法實體突破前高/低，留下引線假突破。
+    3. **強勢反轉 (Strength)**: 出現強烈反向實體K線，破壞近期結構 (ChoCh)。
+    4. **尋找第一次回撤**: 在強勢反轉段中尋找 **合理價值缺口 (FVG)**。
+    5. **標記關鍵區間 (Key Level)**: 畫出 FVG 區域 (圖中彩色半透明區塊)。
+    6. **確認進場 (Entry)**: 當價格**回測進入該 FVG 區間時**觸發訊號。程式自動給出：
+       - **止損 (SL)** 於結構極點外。
+       - **止盈 (TP)** 以 1:2 盈虧比計算出目標價位。
+    """)
+    
+    st.markdown("---")
+    st.markdown("### 🚨 最新交易訊號提示")
+    if signals:
+        latest = signals[-1]
+        signal_color = "🟢 多單 (Buy)" if latest['type'] == 'Buy' else "🔴 空單 (Sell)"
+        st.success(f"**方向**: {signal_color}")
+        st.info(f"**進場價位 (Entry)**: {latest['entry']:.4f}")
+        st.error(f"**止損位 (SL)**: {latest['sl']:.4f}")
+        st.warning(f"**止盈位 (TP)**: {latest['tp']:.4f}")
+        st.write(f"觸發時間: `{latest['time']}`")
     else:
-        st.info("🕒 目前市場監控中，尚未出現符合嚴格條件的 Sniper Entry 訊號...")
+        st.write("目前載入的區間內無符合條件的交易訊號。")
 
-    # --- 繪製互動式圖表 (Plotly) ---
-    fig = go.Figure()
+with col2:
+    # --- Plotly 圖表繪製 ---
+    fig = go.Figure(data=[go.Candlestick(
+        x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'
+    )])
 
-    # K線圖
-    fig.add_trace(go.Candlestick(
-        x=df_signals['Date'],
-        open=df_signals['Open'],
-        high=df_signals['High'],
-        low=df_signals['Low'],
-        close=df_signals['Close'],
-        name='K線',
-        increasing_line_color='green',
-        decreasing_line_color='red'
-    ))
+    # 繪製尚未填補的關鍵區間 (FVG Key Levels)
+    active_fvgs = [fvg for fvg in fvgs if fvg['active']][-10:] # 只顯示近10個避免畫面雜亂
+    for fvg in active_fvgs:
+        color = "rgba(255, 0, 0, 0.2)" if fvg['type'] == 'Bearish' else "rgba(0, 255, 0, 0.2)"
+        fig.add_shape(type="rect", x0=fvg['start_index'], y0=fvg['bottom'], x1=df.index[-1], y1=fvg['top'],
+                      fillcolor=color, line_width=0, layer="below")
 
-    # 標示進場、止損、止盈訊號
-    for i, row in df_signals.iterrows():
-        if row['Signal'] == 1: # 做多
-            # 進場點
-            fig.add_annotation(x=row['Date'], y=row['Entry_Price'], text="🔼 BUY", showarrow=True, arrowhead=1, arrowcolor="green", font=dict(color="white", size=12), bgcolor="green")
-            # 止損線 (紅色)
-            fig.add_shape(type="line", x0=row['Date'], y0=row['SL'], x1=df_signals['Date'].iloc[-1], y1=row['SL'], line=dict(color="red", width=2, dash="dash"))
-            fig.add_annotation(x=df_signals['Date'].iloc[-1], y=row['SL'], text=f"SL: {row['SL']:.4f}", font=dict(color="red"), xanchor="left")
-            # 止盈線 (綠色)
-            fig.add_shape(type="line", x0=row['Date'], y0=row['TP'], x1=df_signals['Date'].iloc[-1], y1=row['TP'], line=dict(color="green", width=2, dash="dash"))
-            fig.add_annotation(x=df_signals['Date'].iloc[-1], y=row['TP'], text=f"TP: {row['TP']:.4f}", font=dict(color="green"), xanchor="left")
-            
-        elif row['Signal'] == -1: # 做空
-            # 進場點
-            fig.add_annotation(x=row['Date'], y=row['Entry_Price'], text="🔽 SELL", showarrow=True, arrowhead=1, arrowcolor="red", font=dict(color="white", size=12), bgcolor="red")
-            # 止損線 (紅色)
-            fig.add_shape(type="line", x0=row['Date'], y0=row['SL'], x1=df_signals['Date'].iloc[-1], y1=row['SL'], line=dict(color="red", width=2, dash="dash"))
-            fig.add_annotation(x=df_signals['Date'].iloc[-1], y=row['SL'], text=f"SL: {row['SL']:.4f}", font=dict(color="red"), xanchor="left")
-            # 止盈線 (綠色)
-            fig.add_shape(type="line", x0=row['Date'], y0=row['TP'], x1=df_signals['Date'].iloc[-1], y1=row['TP'], line=dict(color="green", width=2, dash="dash"))
-            fig.add_annotation(x=df_signals['Date'].iloc[-1], y=row['TP'], text=f"TP: {row['TP']:.4f}", font=dict(color="green"), xanchor="left")
+    # 繪製歷史交易訊號點
+    buy_times =[s['time'] for s in signals if s['type'] == 'Buy']
+    buy_prices =[s['entry'] for s in signals if s['type'] == 'Buy']
+    sell_times =[s['time'] for s in signals if s['type'] == 'Sell']
+    sell_prices =[s['entry'] for s in signals if s['type'] == 'Sell']
 
-    fig.update_layout(
-        title=f"{selected_asset} 價格圖表與交易訊號",
-        yaxis_title="價格",
-        xaxis_title="時間",
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False,
-        height=700,
-        margin=dict(l=50, r=100, b=50, t=50) # 右側留空間給標籤
-    )
+    fig.add_trace(go.Scatter(x=buy_times, y=buy_prices, mode='markers', 
+                             marker=dict(symbol='triangle-up', size=15, color='lime', line=dict(width=1, color='white')), name='做多訊號'))
+    fig.add_trace(go.Scatter(x=sell_times, y=sell_prices, mode='markers', 
+                             marker=dict(symbol='triangle-down', size=15, color='red', line=dict(width=1, color='white')), name='做空訊號'))
 
+    # 若有最新訊號，在畫面上畫出明確的 TP 與 SL 架位線
+    if signals:
+        latest = signals[-1]
+        fig.add_hline(y=latest['sl'], line_dash="dash", line_color="red", annotation_text=f"止損 SL: {latest['sl']:.4f}", annotation_position="top right")
+        fig.add_hline(y=latest['entry'], line_dash="solid", line_color="white", annotation_text=f"進場 Entry: {latest['entry']:.4f}", annotation_position="bottom right", opacity=0.5)
+        fig.add_hline(y=latest['tp'], line_dash="dash", line_color="lime", annotation_text=f"止盈 TP: {latest['tp']:.4f}", annotation_position="bottom right")
+
+    fig.update_layout(xaxis_rangeslider_visible=False, height=700, template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
     st.plotly_chart(fig, use_container_width=True)
-
-    # 顯示數據明細
-    st.subheader("📊 近期觸發之交易訊號紀錄")
-    signals_only = df_signals[df_signals['Signal'] != 0].tail(10)[['Date', 'Close', 'Signal', 'Entry_Price', 'SL', 'TP']]
-    signals_only['Signal'] = signals_only['Signal'].map({1: '做多 (BUY)', -1: '做空 (SELL)'})
-    st.dataframe(signals_only.style.format({'Close': '{:.4f}', 'Entry_Price': '{:.4f}', 'SL': '{:.4f}', 'TP': '{:.4f}'}))
-
-else:
-    st.error("無法抓取數據，請稍後再試。")
