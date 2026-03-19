@@ -10,16 +10,16 @@ st.set_page_config(page_title="NY Session Trading Strategy", layout="wide")
 
 st.title("📈 紐約盤開盤突破 (NY ORB) 交易機器人")
 st.markdown("""
-### 穩定版：支援雲端部署與本地端 🚀
-- **加密貨幣 (BTC/ETH)**：使用 **Bybit 公開 API**，無須 API Key，不阻擋雲端 IP。
+### 突破防火牆 403 封鎖穩定版 🚀
+- **加密貨幣 (BTC/ETH)**：加入瀏覽器偽裝標頭，並使用 **MEXC 公開 API**，無須 API Key 且不阻擋雲端 IP。
 - **傳統金融 (Gold/EUR)**：使用 **Twelve Data API**，需在左側輸入免費 API Key。
 """)
 
 # 側邊欄設定
 st.sidebar.header("⚙️ 交易設定")
-data_source = st.sidebar.radio("選擇市場",["🟢 加密貨幣 (Bybit 免費數據)", "🟡 外匯與黃金 (需 API Key)"])
+data_source = st.sidebar.radio("選擇市場",["🟢 加密貨幣 (免 API Key 穩定版)", "🟡 外匯與黃金 (需 API Key)"])
 
-if data_source == "🟢 加密貨幣 (Bybit 免費數據)":
+if data_source == "🟢 加密貨幣 (免 API Key 穩定版)":
     asset_dict = {
         "Bitcoin (BTC/USDT)": "BTCUSDT",
         "Ethereum (ETH/USDT)": "ETHUSDT",
@@ -40,36 +40,38 @@ else:
 
 days_to_fetch = st.sidebar.slider("載入最近天數", min_value=1, max_value=3, value=2)
 
+# --- 偽裝成真實瀏覽器，防止被 Cloudflare 403 阻擋 ---
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
 # --- 數據獲取函數 (快取 5 分鐘) ---
 @st.cache_data(ttl=300)
 def load_crypto_data(symbol, days):
-    limit = min(days * 288, 1000) # 5m K線每天288根，Bybit最多1000根
-    url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval=5&limit={limit}"
+    limit = min(days * 288, 1000)
+    # 改用 MEXC API，格式同幣安，且對雲端與爬蟲極度友善
+    url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval=5m&limit={limit}"
     try:
-        res = requests.get(url, timeout=10)
-        if res.status_code != 200:
-            st.error(f"連線失敗！Bybit API 錯誤碼: {res.status_code}")
-            return None
+        # 加上 headers 偽裝，破解 403
+        res = requests.get(url, headers=HEADERS, timeout=10)
         
-        data = res.json()
-        if data['retCode'] != 0:
-            st.error(f"Bybit API 拒絕請求: {data['retMsg']}")
+        if res.status_code != 200:
+            st.error(f"連線失敗！MEXC API 錯誤碼: {res.status_code}")
             return None
             
-        # Bybit 回傳的是由新到舊的陣列
-        kline_list = data['result']['list']
-        df = pd.DataFrame(kline_list, columns=['datetime', 'Open', 'High', 'Low', 'Close', 'Volume', 'Turnover'])
+        data = res.json()
         
-        # 轉換時間戳記 (毫秒 -> datetime)
-        df['datetime'] = pd.to_numeric(df['datetime'])
+        # 轉換為 DataFrame (只取前 6 個我們需要的欄位)
+        df = pd.DataFrame(data)
+        df = df.iloc[:, :6] 
+        df.columns = ['datetime', 'Open', 'High', 'Low', 'Close', 'Volume']
+        
         df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+        df.set_index('datetime', inplace=True)
         
-        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        for col in['Open', 'High', 'Low', 'Close', 'Volume']:
             df[col] = df[col].astype(float)
             
-        df.set_index('datetime', inplace=True)
-        df = df.sort_index(ascending=True) # 轉換為由舊到新
-        
         # 設定為紐約時區
         df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
         return df
@@ -82,10 +84,10 @@ def load_twelvedata_data(symbol, days, key):
     limit = min(days * 288, 1000)
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize={limit}&timezone=America/New_York&apikey={key}"
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, headers=HEADERS, timeout=10)
         data = res.json()
         if 'values' not in data:
-            st.error(f"Twelve Data 錯誤: {data.get('message', '無效的 API Key 或請求過於頻繁')}")
+            st.error(f"Twelve Data 錯誤: {data.get('message', '無效的 API Key 或請求頻率過高')}")
             return None
         
         df = pd.DataFrame(data['values'])
@@ -103,7 +105,7 @@ def load_twelvedata_data(symbol, days, key):
 
 # --- 載入數據 ---
 with st.spinner('正在從 API 獲取即時數據...'):
-    if data_source == "🟢 加密貨幣 (Bybit 免費數據)":
+    if data_source == "🟢 加密貨幣 (免 API Key 穩定版)":
         df = load_crypto_data(ticker, days_to_fetch)
     else:
         if not api_key:
@@ -136,36 +138,40 @@ signal_msg = "🕒 該日期的美東時間 09:30-09:45 尚未到達，還無法
 trade_signal = None
 
 if not df_orb.empty:
-    orb_high = float(df_orb['High'].max())
-    orb_low = float(df_orb['Low'].min())
-    
-    # 尋找突破訊號
-    df_post_orb = df_day[df_day.index >= orb_end]
-    
-    for i in range(len(df_post_orb)):
-        current_close = float(df_post_orb['Close'].iloc[i])
-        current_time = df_post_orb.index[i]
+    # 確保 09:45 的 K 線已經結束才算區間確立
+    if df_day.index[-1] >= orb_end:
+        orb_high = float(df_orb['High'].max())
+        orb_low = float(df_orb['Low'].min())
         
-        # 做多
-        if current_close > orb_high:
-            entry_price = current_close
-            sl_price = orb_low
-            tp_price = entry_price + ((entry_price - sl_price) * 1.5)
-            trade_signal = {'Type': 'BUY', 'Time': current_time, 'Entry': entry_price, 'SL': sl_price, 'TP': tp_price}
-            signal_msg = f"🟢 **出現做多訊號！** (突破區間高點)\n\n- **進場時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: `{entry_price:.4f}`\n- **止損 (SL)**: `{sl_price:.4f}`\n- **止盈 (TP)**: `{tp_price:.4f}`"
-            break
+        # 尋找突破訊號
+        df_post_orb = df_day[df_day.index >= orb_end]
+        
+        for i in range(len(df_post_orb)):
+            current_close = float(df_post_orb['Close'].iloc[i])
+            current_time = df_post_orb.index[i]
             
-        # 做空
-        elif current_close < orb_low:
-            entry_price = current_close
-            sl_price = orb_high
-            tp_price = entry_price - ((sl_price - entry_price) * 1.5)
-            trade_signal = {'Type': 'SELL', 'Time': current_time, 'Entry': entry_price, 'SL': sl_price, 'TP': tp_price}
-            signal_msg = f"🔴 **出現做空訊號！** (跌破區間低點)\n\n- **進場時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: `{entry_price:.4f}`\n- **止損 (SL)**: `{sl_price:.4f}`\n- **止盈 (TP)**: `{tp_price:.4f}`"
-            break
-            
-    if not trade_signal:
-        signal_msg = "⏳ 今日開盤區間已確立，目前走勢尚在區間內，等待突破..."
+            # 做多
+            if current_close > orb_high:
+                entry_price = current_close
+                sl_price = orb_low
+                tp_price = entry_price + ((entry_price - sl_price) * 1.5)
+                trade_signal = {'Type': 'BUY', 'Time': current_time, 'Entry': entry_price, 'SL': sl_price, 'TP': tp_price}
+                signal_msg = f"🟢 **出現做多訊號！** (突破區間高點)\n\n- **進場時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: `{entry_price:.4f}`\n- **止損 (SL)**: `{sl_price:.4f}`\n- **止盈 (TP)**: `{tp_price:.4f}`"
+                break
+                
+            # 做空
+            elif current_close < orb_low:
+                entry_price = current_close
+                sl_price = orb_high
+                tp_price = entry_price - ((sl_price - entry_price) * 1.5)
+                trade_signal = {'Type': 'SELL', 'Time': current_time, 'Entry': entry_price, 'SL': sl_price, 'TP': tp_price}
+                signal_msg = f"🔴 **出現做空訊號！** (跌破區間低點)\n\n- **進場時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: `{entry_price:.4f}`\n- **止損 (SL)**: `{sl_price:.4f}`\n- **止盈 (TP)**: `{tp_price:.4f}`"
+                break
+                
+        if not trade_signal:
+            signal_msg = "⏳ 今日開盤區間已確立，目前走勢尚在區間內，等待突破..."
+    else:
+         signal_msg = "🕒 目前正在紐約盤開盤區間內 (09:30-09:45)，請等待區間結束。"
 
 # --- 畫面顯示 ---
 st.subheader(f"💡 即時交易訊號 ({selected_date})")
@@ -212,7 +218,7 @@ for start_time, end_time, color, name in session_colors:
     fig.add_vrect(x0=s_time, x1=e_time, fillcolor=color, opacity=1, layer="below", line_width=0, annotation_text=name, annotation_position="top left")
 
 fig.update_layout(
-    title=f"{selected_asset} 走勢圖 (以美東時間顯示)",
+    title=f"{selected_asset} 走勢圖 (以美東時間 EST 顯示)",
     yaxis_title="價格 (USD)", xaxis_title="美東時間 (EST)",
     height=750, xaxis_rangeslider_visible=False, template="plotly_dark"
 )
