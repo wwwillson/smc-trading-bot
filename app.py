@@ -39,8 +39,12 @@ days_to_fetch = st.sidebar.slider("選擇回測天數 (最高 360 天)", min_val
 # --- 獲取數據 ---
 @st.cache_data(ttl=3600)
 def load_data(ticker, days):
-    # yfinance 1h 數據最高支援 730 天
     data = yf.download(ticker, period=f"{days}d", interval="1h")
+    
+    # 【修復】處理 yfinance 新版本回傳雙層標籤 (MultiIndex) 的問題
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+        
     data.dropna(inplace=True)
     return data
 
@@ -62,13 +66,15 @@ def run_backtest(df):
         ref_candle = group.iloc[:4]
         trading_session = group.iloc[4:]
         
-        ref_open = ref_candle['Open'].iloc[0]
-        ref_close = ref_candle['Close'].iloc[-1]
-        ref_high = ref_candle['High'].max()
-        ref_low = ref_candle['Low'].min()
+        # 【修復】強制轉換為 float 單一數值，避免 Series 造成真假值判斷錯誤
+        ref_open = float(ref_candle['Open'].iloc[0])
+        ref_close = float(ref_candle['Close'].iloc[-1])
+        ref_high = float(ref_candle['High'].max())
+        ref_low = float(ref_candle['Low'].min())
         ref_range = ref_high - ref_low
         
-        if ref_range == 0: continue
+        if ref_range == 0: 
+            continue
         
         # 判斷方向
         bias = "Bullish" if ref_close > ref_open else "Bearish"
@@ -86,22 +92,24 @@ def run_backtest(df):
         pnl = 0
         
         for idx, row in trading_session.iterrows():
+            current_high = float(row['High'])
+            current_low = float(row['Low'])
+            
             # 還沒進場，尋找進場點
             if entry_price is None:
                 if bias == "Bullish":
                     # 價格回撤進入 25% ~ 50% 區間
-                    if row['Low'] <= level_25 and row['High'] >= level_50:
-                        entry_price = level_25 # 假設觸碰到 25% 邊界就進場
+                    if current_low <= level_25 and current_high >= level_50:
+                        entry_price = level_25 
                         sl_price = level_75
                         tp_price = entry_price + (entry_price - sl_price) * 2 # 1:2 RR
                 elif bias == "Bearish":
-                    # 價格反彈進入底部算起 25%~50% (即從上往下看的 50%~75%)
-                    # 轉換為 Bearish 視角：Optimum 是從 Low 往上的 25%~50%
+                    # 價格反彈進入底部算起 25%~50% 區間
                     bear_level_25 = ref_low + (ref_range * 0.25)
                     bear_level_50 = ref_low + (ref_range * 0.50)
                     bear_level_75 = ref_low + (ref_range * 0.75)
                     
-                    if row['High'] >= bear_level_25 and row['Low'] <= bear_level_50:
+                    if current_high >= bear_level_25 and current_low <= bear_level_50:
                         entry_price = bear_level_25
                         sl_price = bear_level_75
                         tp_price = entry_price - (sl_price - entry_price) * 2 # 1:2 RR
@@ -109,23 +117,23 @@ def run_backtest(df):
             # 已經進場，檢查止盈或止損
             else:
                 if bias == "Bullish":
-                    if row['Low'] <= sl_price:
+                    if current_low <= sl_price:
                         trade_status = "Hit SL"
                         exit_time = idx
                         pnl = -1 # 用 R 為單位 (損失 1R)
                         break
-                    elif row['High'] >= tp_price:
+                    elif current_high >= tp_price:
                         trade_status = "Hit TP"
                         exit_time = idx
                         pnl = 2 # 獲利 2R
                         break
                 elif bias == "Bearish":
-                    if row['High'] >= sl_price:
+                    if current_high >= sl_price:
                         trade_status = "Hit SL"
                         exit_time = idx
                         pnl = -1
                         break
-                    elif row['Low'] <= tp_price:
+                    elif current_low <= tp_price:
                         trade_status = "Hit TP"
                         exit_time = idx
                         pnl = 2
@@ -135,11 +143,11 @@ def run_backtest(df):
             trades.append({
                 "Date": date,
                 "Bias": bias,
-                "Entry Time": trading_session.index[0], # 簡化顯示
+                "Entry Time": trading_session.index[0], 
                 "Exit Time": exit_time if exit_time else "End of Day",
-                "Entry Price": round(float(entry_price), 2),
-                "SL": round(float(sl_price), 2),
-                "TP": round(float(tp_price), 2),
+                "Entry Price": round(entry_price, 2),
+                "SL": round(sl_price, 2),
+                "TP": round(tp_price, 2),
                 "Outcome": trade_status if exit_time else "Closed at EOD",
                 "PnL (R)": pnl
             })
@@ -163,7 +171,7 @@ if not data.empty:
         col1.metric("總交易次數", total_trades)
         col2.metric("勝率 (僅計 SL/TP)", f"{win_rate:.2f}%")
         col3.metric("總盈虧 (單位: R)", f"{total_pnl} R")
-        col4.metric("目前市場趨勢", trades_df.iloc[-1]['Bias'])
+        col4.metric("最新一天趨勢", trades_df.iloc[-1]['Bias'])
 
         # --- 繪製最新交易圖表 ---
         st.write("---")
@@ -181,9 +189,9 @@ if not data.empty:
                         name="市場價格")])
         
         # 標示出進場、止損、止盈線
-        entry = trades_df.iloc[-1]['Entry Price']
-        sl = trades_df.iloc[-1]['SL']
-        tp = trades_df.iloc[-1]['TP']
+        entry = float(trades_df.iloc[-1]['Entry Price'])
+        sl = float(trades_df.iloc[-1]['SL'])
+        tp = float(trades_df.iloc[-1]['TP'])
         bias = trades_df.iloc[-1]['Bias']
         outcome = trades_df.iloc[-1]['Outcome']
         
@@ -217,6 +225,6 @@ if not data.empty:
         st.dataframe(styled_df, use_container_width=True)
 
     else:
-        st.warning("在所選的時間範圍內沒有找到符合策略的交易訊號。")
+        st.warning("在所選的時間範圍內沒有找到符合進場策略的交易訊號。")
 else:
     st.error("無法獲取數據，請檢查網路連線或稍後再試。")
