@@ -8,219 +8,266 @@ import requests
 # 設定網頁佈局
 st.set_page_config(page_title="NY Session Trading Strategy", layout="wide")
 
-st.title("📈 紐約盤開盤突破 (NY ORB) 交易機器人")
+st.title("📈 紐約盤開盤突破 (NY ORB) 交易與回測系統")
 st.markdown("""
-### 突破防火牆 403 封鎖穩定版 🚀
-- **加密貨幣 (BTC/ETH)**：加入瀏覽器偽裝標頭，並使用 **MEXC 公開 API**，無須 API Key 且不阻擋雲端 IP。
-- **傳統金融 (Gold/EUR)**：使用 **Twelve Data API**，需在左側輸入免費 API Key。
+- **100% 免費 & 免 API Key**：利用幣安全球公開節點獲取 BTC、黃金代幣(PAXG)、歐元(EUR)。
+- **自動回測系統**：自動抓取過去 3 個月歷史資料，判定進場後是否順利達到 1.5R 止盈或是打到止損。
 """)
 
 # 側邊欄設定
 st.sidebar.header("⚙️ 交易設定")
-data_source = st.sidebar.radio("選擇市場",["🟢 加密貨幣 (免 API Key 穩定版)", "🟡 外匯與黃金 (需 API Key)"])
-
-if data_source == "🟢 加密貨幣 (免 API Key 穩定版)":
-    asset_dict = {
-        "Bitcoin (BTC/USDT)": "BTCUSDT",
-        "Ethereum (ETH/USDT)": "ETHUSDT",
-        "Solana (SOL/USDT)": "SOLUSDT"
-    }
-    selected_asset = st.sidebar.selectbox("選擇交易標的", list(asset_dict.keys()))
-    ticker = asset_dict[selected_asset]
-    api_key = None
-else:
-    st.sidebar.markdown("👉[點此前往 Twelve Data 免費註冊獲取 Key](https://twelvedata.com/)")
-    api_key = st.sidebar.text_input("輸入 Twelve Data API Key", type="password")
-    asset_dict = {
-        "Gold (XAU/USD)": "XAU/USD",
-        "Euro (EUR/USD)": "EUR/USD"
-    }
-    selected_asset = st.sidebar.selectbox("選擇交易標的", list(asset_dict.keys()))
-    ticker = asset_dict[selected_asset]
-
-days_to_fetch = st.sidebar.slider("載入最近天數", min_value=1, max_value=3, value=2)
-
-# --- 偽裝成真實瀏覽器，防止被 Cloudflare 403 阻擋 ---
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+asset_dict = {
+    "Bitcoin (BTC/USDT)": "BTCUSDT",
+    "Ethereum (ETH/USDT)": "ETHUSDT",
+    "Gold 黃金 (PAXG/USDT)": "PAXGUSDT",  # PAXG 1:1 錨定黃金
+    "Euro 歐元 (EUR/USDT)": "EURUSDT"    # 歐元兌美元
 }
+selected_asset = st.sidebar.selectbox("選擇交易標的", list(asset_dict.keys()))
+ticker = asset_dict[selected_asset]
 
-# --- 數據獲取函數 (快取 5 分鐘) ---
-@st.cache_data(ttl=300)
-def load_crypto_data(symbol, days):
-    limit = min(days * 288, 1000)
-    # 改用 MEXC API，格式同幣安，且對雲端與爬蟲極度友善
-    url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval=5m&limit={limit}"
-    try:
-        # 加上 headers 偽裝，破解 403
-        res = requests.get(url, headers=HEADERS, timeout=10)
-        
-        if res.status_code != 200:
-            st.error(f"連線失敗！MEXC API 錯誤碼: {res.status_code}")
-            return None
-            
-        data = res.json()
-        
-        # 轉換為 DataFrame (只取前 6 個我們需要的欄位)
-        df = pd.DataFrame(data)
-        df = df.iloc[:, :6] 
-        df.columns = ['datetime', 'Open', 'High', 'Low', 'Close', 'Volume']
-        
-        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
-        df.set_index('datetime', inplace=True)
-        
-        for col in['Open', 'High', 'Low', 'Close', 'Volume']:
-            df[col] = df[col].astype(float)
-            
-        # 設定為紐約時區
-        df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
-        return df
-    except Exception as e:
-        st.error(f"發生網路異常: {e}")
-        return None
+# --- 數據獲取函數 (利用迴圈抓取長達 3 個月的資料) ---
+@st.cache_data(ttl=3600)
+def load_historical_data(symbol, days=90):
+    end_time = int(datetime.now().timestamp() * 1000)
+    start_time = end_time - (days * 24 * 60 * 60 * 1000)
+    all_data =[]
+    
+    # 幣安免翻牆公開資料庫，不封鎖雲端主機
+    url = "https://data-api.binance.vision/api/v3/klines"
+    
+    with st.spinner(f'正在獲取 {selected_asset} 近 {days} 天歷史數據 (可能需要幾秒鐘)...'):
+        while start_time < end_time:
+            params = {
+                "symbol": symbol,
+                "interval": "5m",
+                "limit": 1000,
+                "startTime": start_time,
+                "endTime": end_time
+            }
+            try:
+                res = requests.get(url, params=params, timeout=10)
+                if res.status_code == 200:
+                    data = res.json()
+                    if not data:
+                        break
+                    all_data.extend(data)
+                    # 將下一次抓取的起始時間設為最後一根 K 線時間 + 1 毫秒
+                    start_time = data[-1][0] + 1
+                else:
+                    break
+            except Exception:
+                break
 
-@st.cache_data(ttl=300)
-def load_twelvedata_data(symbol, days, key):
-    limit = min(days * 288, 1000)
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize={limit}&timezone=America/New_York&apikey={key}"
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=10)
-        data = res.json()
-        if 'values' not in data:
-            st.error(f"Twelve Data 錯誤: {data.get('message', '無效的 API Key 或請求頻率過高')}")
-            return None
+    if not all_data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_data).iloc[:, :6]
+    df.columns =['datetime', 'Open', 'High', 'Low', 'Close', 'Volume']
+    df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+    
+    for col in['Open', 'High', 'Low', 'Close', 'Volume']:
+        df[col] = df[col].astype(float)
         
-        df = pd.DataFrame(data['values'])
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df.set_index('datetime', inplace=True)
-        for col in['open', 'high', 'low', 'close']:
-            df[col] = df[col].astype(float)
-        df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'})
-        df = df.sort_index(ascending=True)
-        df.index = df.index.tz_localize('America/New_York')
-        return df
-    except Exception as e:
-        st.error(f"發生網路異常: {e}")
-        return None
+    df.set_index('datetime', inplace=True)
+    df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
+    df = df[~df.index.duplicated(keep='first')] # 移除重複值
+    return df
 
-# --- 載入數據 ---
-with st.spinner('正在從 API 獲取即時數據...'):
-    if data_source == "🟢 加密貨幣 (免 API Key 穩定版)":
-        df = load_crypto_data(ticker, days_to_fetch)
-    else:
-        if not api_key:
-            st.warning("⚠️ 必須在左側側邊欄輸入 Twelve Data API Key 才能載入外匯/黃金數據。")
-            st.stop()
-        df = load_twelvedata_data(ticker, days_to_fetch, api_key)
+# 載入近 90 天資料
+df = load_historical_data(ticker, days=90)
 
-if df is None or df.empty:
-    st.error("❌ 獲取數據失敗，請查看上方的詳細錯誤訊息。")
+if df.empty:
+    st.error("❌ 獲取數據失敗，請確認網路連線。")
     st.stop()
 
-# --- 選擇日期與策略邏輯 ---
-available_dates = sorted(list(set(df.index.date)), reverse=True)
-selected_date = st.sidebar.selectbox("選擇查看日期", available_dates)
+# --- 建立 UI 兩個分頁 ---
+tab1, tab2 = st.tabs(["📊 即時交易圖表 (單日)", "📋 近三個月回測報告 (自動判定)"])
 
-df_day = df[df.index.date == selected_date]
-if df_day.empty:
-    st.warning("該日期無可用的交易數據。")
-    st.stop()
+# ==========================================
+# 分頁 1: 即時圖表邏輯
+# ==========================================
+with tab1:
+    available_dates = sorted(list(set(df.index.date)), reverse=True)
+    selected_date = st.selectbox("選擇查看日期", available_dates)
 
-# 標記 09:30 - 09:45 區間
-orb_start = datetime.combine(selected_date, datetime.strptime("09:30", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
-orb_end = datetime.combine(selected_date, datetime.strptime("09:45", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
+    df_day = df[df.index.date == selected_date]
+    
+    orb_start = datetime.combine(selected_date, datetime.strptime("09:30", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
+    orb_end = datetime.combine(selected_date, datetime.strptime("09:45", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
 
-df_orb = df_day[(df_day.index >= orb_start) & (df_day.index < orb_end)]
+    df_orb = df_day[(df_day.index >= orb_start) & (df_day.index < orb_end)]
+    
+    orb_high = orb_low = None
+    trade_signal = None
+    signal_msg = "🕒 該日期的美東時間 09:30-09:45 尚未到達，還無法確立開盤區間。"
 
-orb_high = None
-orb_low = None
-signal_msg = "🕒 該日期的美東時間 09:30-09:45 尚未到達，還無法確立開盤區間。"
-trade_signal = None
-
-if not df_orb.empty:
-    # 確保 09:45 的 K 線已經結束才算區間確立
-    if df_day.index[-1] >= orb_end:
-        orb_high = float(df_orb['High'].max())
-        orb_low = float(df_orb['Low'].min())
-        
-        # 尋找突破訊號
-        df_post_orb = df_day[df_day.index >= orb_end]
-        
-        for i in range(len(df_post_orb)):
-            current_close = float(df_post_orb['Close'].iloc[i])
-            current_time = df_post_orb.index[i]
+    if not df_orb.empty:
+        if df_day.index[-1] >= orb_end:
+            orb_high = float(df_orb['High'].max())
+            orb_low = float(df_orb['Low'].min())
+            df_post_orb = df_day[df_day.index >= orb_end]
             
-            # 做多
-            if current_close > orb_high:
-                entry_price = current_close
-                sl_price = orb_low
-                tp_price = entry_price + ((entry_price - sl_price) * 1.5)
-                trade_signal = {'Type': 'BUY', 'Time': current_time, 'Entry': entry_price, 'SL': sl_price, 'TP': tp_price}
-                signal_msg = f"🟢 **出現做多訊號！** (突破區間高點)\n\n- **進場時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: `{entry_price:.4f}`\n- **止損 (SL)**: `{sl_price:.4f}`\n- **止盈 (TP)**: `{tp_price:.4f}`"
-                break
+            for i in range(len(df_post_orb)):
+                current_close = float(df_post_orb['Close'].iloc[i])
+                current_time = df_post_orb.index[i]
                 
-            # 做空
-            elif current_close < orb_low:
-                entry_price = current_close
-                sl_price = orb_high
-                tp_price = entry_price - ((sl_price - entry_price) * 1.5)
-                trade_signal = {'Type': 'SELL', 'Time': current_time, 'Entry': entry_price, 'SL': sl_price, 'TP': tp_price}
-                signal_msg = f"🔴 **出現做空訊號！** (跌破區間低點)\n\n- **進場時間**: {current_time.strftime('%H:%M')}\n- **進場價位**: `{entry_price:.4f}`\n- **止損 (SL)**: `{sl_price:.4f}`\n- **止盈 (TP)**: `{tp_price:.4f}`"
-                break
-                
-        if not trade_signal:
-            signal_msg = "⏳ 今日開盤區間已確立，目前走勢尚在區間內，等待突破..."
-    else:
-         signal_msg = "🕒 目前正在紐約盤開盤區間內 (09:30-09:45)，請等待區間結束。"
+                if current_close > orb_high:
+                    entry_price = current_close
+                    sl_price = orb_low
+                    tp_price = entry_price + ((entry_price - sl_price) * 1.5)
+                    trade_signal = {'Type': 'BUY', 'Time': current_time, 'Entry': entry_price, 'SL': sl_price, 'TP': tp_price}
+                    signal_msg = f"🟢 **出現做多訊號！** (突破高點) | 進場: `{entry_price:.4f}` | 止損: `{sl_price:.4f}` | 止盈: `{tp_price:.4f}`"
+                    break
+                elif current_close < orb_low:
+                    entry_price = current_close
+                    sl_price = orb_high
+                    tp_price = entry_price - ((sl_price - entry_price) * 1.5)
+                    trade_signal = {'Type': 'SELL', 'Time': current_time, 'Entry': entry_price, 'SL': sl_price, 'TP': tp_price}
+                    signal_msg = f"🔴 **出現做空訊號！** (跌破低點) | 進場: `{entry_price:.4f}` | 止損: `{sl_price:.4f}` | 止盈: `{tp_price:.4f}`"
+                    break
+            if not trade_signal:
+                signal_msg = "⏳ 今日開盤區間已確立，目前走勢尚在區間內，等待突破..."
+        else:
+             signal_msg = "🕒 目前正在紐約盤開盤區間內 (09:30-09:45)，請等待區間結束。"
 
-# --- 畫面顯示 ---
-st.subheader(f"💡 即時交易訊號 ({selected_date})")
-if "做多" in signal_msg or "做空" in signal_msg:
-    st.success(signal_msg)
-else:
     st.info(signal_msg)
 
-# 繪製圖表
-fig = go.Figure()
+    # 畫圖
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df_day.index, open=df_day['Open'], high=df_day['High'], low=df_day['Low'], close=df_day['Close'], name="5m K線"))
 
-# 加入 K 線
-fig.add_trace(go.Candlestick(
-    x=df_day.index, open=df_day['Open'], high=df_day['High'],
-    low=df_day['Low'], close=df_day['Close'], name="5m K線"
-))
+    if orb_high is not None and orb_low is not None:
+        fig.add_hline(y=orb_high, line_dash="dash", line_color="orange", annotation_text="ORB High")
+        fig.add_hline(y=orb_low, line_dash="dash", line_color="orange", annotation_text="ORB Low", annotation_position="bottom right")
+        if trade_signal:
+            fig.add_vline(x=trade_signal['Time'], line_dash="dot", line_color="white")
+            fig.add_trace(go.Scatter(x=[trade_signal['Time']], y=[trade_signal['Entry']], mode='markers', marker=dict(color='yellow', size=10), name="Entry"))
+            fig.add_hline(y=trade_signal['SL'], line_color="red", annotation_text="SL (止損)")
+            fig.add_hline(y=trade_signal['TP'], line_color="green", annotation_text="TP (止盈 1.5R)")
 
-if orb_high is not None and orb_low is not None:
-    # 畫 ORB 區間線
-    fig.add_hline(y=orb_high, line_dash="dash", line_color="orange", annotation_text="ORB High 09:45")
-    fig.add_hline(y=orb_low, line_dash="dash", line_color="orange", annotation_text="ORB Low 09:45", annotation_position="bottom right")
+    session_colors =[("00:00", "03:00", "rgba(255, 255, 0, 0.05)", "Asian"), ("03:00", "08:00", "rgba(0, 255, 255, 0.05)", "London"), ("08:00", "17:00", "rgba(255, 0, 255, 0.05)", "New York")]
+    for start_t, end_t, color, name in session_colors:
+        s_time = datetime.combine(selected_date, datetime.strptime(start_t, "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
+        e_time = datetime.combine(selected_date, datetime.strptime(end_t, "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
+        fig.add_vrect(x0=s_time, x1=e_time, fillcolor=color, opacity=1, layer="below", line_width=0, annotation_text=name, annotation_position="top left")
 
-    # 畫出止損與止盈標記
-    if trade_signal:
-        fig.add_vline(x=trade_signal['Time'], line_width=2, line_dash="dot", line_color="white")
+    fig.update_layout(height=700, xaxis_rangeslider_visible=False, template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
+    st.plotly_chart(fig, use_container_width=True)
+
+# ==========================================
+# 分頁 2: 90 天自動回測與盈虧判定表
+# ==========================================
+with tab2:
+    st.subheader(f"📊 {selected_asset} 近三個月 (90天) 回測報告")
+    
+    results =[]
+    dates = pd.Series(df.index.date).unique()
+    
+    # 執行回測迴圈
+    for d in dates:
+        df_d = df[df.index.date == d]
         
-        fig.add_trace(go.Scatter(
-            x=[trade_signal['Time']], y=[trade_signal['Entry']], mode='markers+text',
-            marker=dict(color='yellow', size=12), text=["進場點"], textposition="middle right", name="Entry"
-        ))
+        orb_s = datetime.combine(d, datetime.strptime("09:30", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
+        orb_e = datetime.combine(d, datetime.strptime("09:45", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
+        ny_end = datetime.combine(d, datetime.strptime("16:00", "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
         
-        fig.add_hline(y=trade_signal['SL'], line_width=2, line_color="red", annotation_text=f"止損 SL ({trade_signal['SL']:.4f})")
-        fig.add_hline(y=trade_signal['TP'], line_width=2, line_color="green", annotation_text=f"止盈 TP 1.5R ({trade_signal['TP']:.4f})")
+        df_orb = df_d[(df_d.index >= orb_s) & (df_d.index < orb_e)]
+        if len(df_orb) < 3: # 無完整 ORB 數據則跳過
+            continue
+            
+        o_high = df_orb['High'].max()
+        o_low = df_orb['Low'].min()
+        
+        df_post = df_d[(df_d.index >= orb_e) & (df_d.index <= ny_end)]
+        
+        entered = False
+        t_type = ""
+        e_price = 0
+        sl = tp = 0
+        e_time = None
+        
+        # 1. 尋找進場點
+        for idx, row in df_post.iterrows():
+            if row['Close'] > o_high:
+                entered, t_type, e_price, sl = True, "Long (做多)", row['Close'], o_low
+                tp = e_price + (e_price - sl) * 1.5
+                e_time = idx
+                break
+            elif row['Close'] < o_low:
+                entered, t_type, e_price, sl = True, "Short (做空)", row['Close'], o_high
+                tp = e_price - (sl - e_price) * 1.5
+                e_time = idx
+                break
+                
+        # 2. 判定出場 (止損/止盈/收盤)
+        if entered:
+            df_eval = df_post[df_post.index > e_time]
+            outcome = "Pending (未平倉)"
+            ex_price = 0
+            ex_time = None
+            pnl = 0
+            
+            for e_idx, e_row in df_eval.iterrows():
+                if t_type == "Long (做多)":
+                    if e_row['Low'] <= sl:  # 打到止損
+                        outcome, ex_price, ex_time, pnl = "🔴 虧損 (打到止損)", sl, e_idx, -1.0
+                        break
+                    elif e_row['High'] >= tp: # 打到止盈
+                        outcome, ex_price, ex_time, pnl = "🟢 獲利 (打到止盈)", tp, e_idx, 1.5
+                        break
+                else:
+                    if e_row['High'] >= sl:
+                        outcome, ex_price, ex_time, pnl = "🔴 虧損 (打到止損)", sl, e_idx, -1.0
+                        break
+                    elif e_row['Low'] <= tp:
+                        outcome, ex_price, ex_time, pnl = "🟢 獲利 (打到止盈)", tp, e_idx, 1.5
+                        break
+            
+            # 若到 16:00 仍未打到止盈止損，則收盤平倉
+            if outcome == "Pending (未平倉)" and not df_eval.empty:
+                ex_price = df_eval.iloc[-1]['Close']
+                ex_time = df_eval.index[-1]
+                if t_type == "Long (做多)":
+                    pnl = (ex_price - e_price) / (e_price - sl)
+                else:
+                    pnl = (e_price - ex_price) / (sl - e_price)
+                
+                outcome = "🟢 獲利 (收盤平倉)" if pnl > 0 else "🔴 虧損 (收盤平倉)"
 
-# 背景顏色：時段劃分
-session_colors =[
-    ("00:00", "03:00", "rgba(255, 255, 0, 0.05)", "Asian Session"),
-    ("03:00", "08:00", "rgba(0, 255, 255, 0.05)", "London Session"),
-    ("08:00", "17:00", "rgba(255, 0, 255, 0.05)", "New York Session")
-]
-for start_time, end_time, color, name in session_colors:
-    s_time = datetime.combine(selected_date, datetime.strptime(start_time, "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
-    e_time = datetime.combine(selected_date, datetime.strptime(end_time, "%H:%M").time()).replace(tzinfo=pytz.timezone('America/New_York'))
-    fig.add_vrect(x0=s_time, x1=e_time, fillcolor=color, opacity=1, layer="below", line_width=0, annotation_text=name, annotation_position="top left")
+            results.append({
+                "日期": str(d),
+                "方向": t_type,
+                "進場時間": e_time.strftime('%H:%M'),
+                "進場價": round(e_price, 4),
+                "止損價 (SL)": round(sl, 4),
+                "止盈價 (TP)": round(tp, 4),
+                "出場時間": ex_time.strftime('%H:%M') if ex_time else "-",
+                "出場價": round(ex_price, 4) if ex_price else "-",
+                "結果": outcome,
+                "盈虧 (R)": round(pnl, 2)
+            })
 
-fig.update_layout(
-    title=f"{selected_asset} 走勢圖 (以美東時間 EST 顯示)",
-    yaxis_title="價格 (USD)", xaxis_title="美東時間 (EST)",
-    height=750, xaxis_rangeslider_visible=False, template="plotly_dark"
-)
-
-st.plotly_chart(fig, use_container_width=True)
+    # 輸出表格
+    if results:
+        df_results = pd.DataFrame(results)
+        
+        # 計算統計數據
+        total_trades = len(df_results)
+        wins = len(df_results[df_results['盈虧 (R)'] > 0])
+        win_rate = (wins / total_trades) * 100
+        net_r = df_results['盈虧 (R)'].sum()
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("總交易次數", f"{total_trades} 次")
+        col2.metric("總勝率 (Win Rate)", f"{win_rate:.1f} %")
+        col3.metric("總淨盈虧 (Risk Reward)", f"{net_r:.2f} R")
+        
+        # 標色顯示表格
+        def color_outcome(val):
+            if '獲利' in str(val): return 'color: #00FF00'
+            elif '虧損' in str(val): return 'color: #FF4B4B'
+            return ''
+            
+        st.dataframe(df_results.style.map(color_outcome, subset=['結果']), height=600, use_container_width=True)
+    else:
+        st.info("過去 3 個月內無符合交易條件的紀錄。")
