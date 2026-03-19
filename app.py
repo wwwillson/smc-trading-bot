@@ -47,11 +47,16 @@ def fetch_binance_klines(symbol, interval, days):
     while start_time < end_time:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit, "startTime": start_time, "endTime": end_time}
-        res = requests.get(url, params=params)
-        data = res.json()
-        if not data or isinstance(data, dict): break
-        all_data.extend(data)
-        start_time = data[-1][0] + 1 # 找下一根K線
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            data = res.json()
+            # 如果回傳的是字典代表出現錯誤(例如美國IP被阻擋)
+            if not data or isinstance(data, dict): 
+                break
+            all_data.extend(data)
+            start_time = data[-1][0] + 1 # 找下一根K線
+        except Exception:
+            break
         
     if not all_data: return pd.DataFrame()
         
@@ -75,11 +80,30 @@ with st.spinner(f"正在從幣安即時同步 {symbol} 資料..."):
     live_m1 = fetch_binance_klines(symbol, '1m', 1)
     live_m15 = fetch_binance_klines(symbol, '15m', 2)
     
-    # 合併大數據與實盤最新數據
-    m1_data = pd.concat([bulk_m1, live_m1]).drop_duplicates()
-    m1_data = m1_data[~m1_data.index.duplicated(keep='last')].sort_index()
-    m15_data = pd.concat([bulk_m15, live_m15]).drop_duplicates()
-    m15_data = m15_data[~m15_data.index.duplicated(keep='last')].sort_index()
+    # 🟢 安全合併大數據與實盤最新數據防呆機制
+    dfs_m1 =[df for df in [bulk_m1, live_m1] if not df.empty]
+    m1_data = pd.concat(dfs_m1).drop_duplicates() if dfs_m1 else pd.DataFrame()
+    if not m1_data.empty:
+        m1_data = m1_data[~m1_data.index.duplicated(keep='last')].sort_index()
+
+    dfs_m15 = [df for df in[bulk_m15, live_m15] if not df.empty]
+    m15_data = pd.concat(dfs_m15).drop_duplicates() if dfs_m15 else pd.DataFrame()
+    if not m15_data.empty:
+        m15_data = m15_data[~m15_data.index.duplicated(keep='last')].sort_index()
+
+# 🔴 若抓不到資料，立刻阻斷程式並提示使用者
+if m1_data.empty or m15_data.empty or 'Close' not in m1_data.columns:
+    st.error("❌ 無法從幣安 (Binance) API 獲取資料！")
+    st.warning("""
+    💡 **可能原因分析：**
+    1. **IP 遭到封鎖 (最常見)**：Streamlit Cloud 的伺服器位於美國，而幣安嚴格封鎖來自美國 IP 的連線，因此拒絕回傳資料。
+    2. **請求過快**：瞬間索取大量歷史資料觸發了交易所的流量防護機制。
+    
+    🎯 **解決方案：**
+    - 請在 **您的本地端電腦運行此程式** (Localhost)。只要您的電腦不在美國，API 就能完美運行！
+    - 若必須在雲端執行，請於左側使用 **CSV 上傳模式** (上傳從 TradingView 匯出的資料)。
+    """)
+    st.stop()
 
 # --- 核心交易演算法 (包含嚴格過濾) ---
 def run_strategy(m1, m15, rr):
@@ -98,7 +122,7 @@ def run_strategy(m1, m15, rr):
         sweep_type, sl_price, swept_level, swept_time = None, 0, 0, None
         avg_range = (m15['High'].iloc[i-14:i] - m15['Low'].iloc[i-14:i]).mean()
         
-        # 判斷做空 Fakeout (實體收回 + 水平線未曾破壞 + 明顯拉回)
+        # 判斷做空 Fakeout
         gap_df_high = m15.iloc[prev_high_idx+1 : i]
         if not gap_df_high.empty and gap_df_high['High'].max() < prev_high:
             if current_m15['High'] > prev_high and current_m15['Close'] < prev_high and current_m15['Open'] < prev_high:
@@ -106,7 +130,7 @@ def run_strategy(m1, m15, rr):
                 if gap_df_high['Low'].min() < m15.iloc[prev_high_idx]['Low'] and pullback_depth > avg_range:
                     sweep_type, sl_price, swept_level, swept_time = 'Short', current_m15['High'], prev_high, prev_high_time
 
-        # 判斷做多 Fakeout (實體收回 + 水平線未曾破壞 + 明顯拉回)
+        # 判斷做多 Fakeout
         if not sweep_type:
             gap_df_low = m15.iloc[prev_low_idx+1 : i]
             if not gap_df_low.empty and gap_df_low['Low'].min() > prev_low:
@@ -126,7 +150,6 @@ def run_strategy(m1, m15, rr):
             m15_open_price = next_m15['Open']
             entry_price, entry_time = None, None
             
-            # M1 級別精準入場
             for j in range(len(m1_window)):
                 m1_candle = m1_window.iloc[j]
                 if sweep_type == 'Short' and m1_candle['Close'] < m15_open_price:
@@ -168,7 +191,6 @@ st.subheader("⚡ 實盤即時進場資訊 (每5分鐘自動更新)")
 current_price = m1_data['Close'].iloc[-1]
 last_update_time = m1_data.index[-1].strftime('%Y-%m-%d %H:%M:%S')
 
-# 判斷實盤狀態
 live_status_msg = "🕒 策略持續監控 M15 級別流動性中... 目前無信號。"
 live_color = "normal"
 
@@ -178,25 +200,23 @@ if not trades_df.empty:
         live_status_msg = f"🚨 **實盤持有中！** 方向: **{last_trade['Type']}** | 進場價: **{last_trade['Entry Price']}** | 止損: **{last_trade['SL']}** | 止盈: **{last_trade['TP']}**"
         live_color = "inverse"
 
-# 若未持有，但上一根剛發生假突破
 if live_color == "normal":
     i_live = len(m15_data) - 2
-    search_window = m15_data.iloc[i_live-20 : i_live-3]
-    if not search_window.empty:
-        p_high, p_low = search_window['High'].max(), search_window['Low'].min()
-        c_m15 = m15_data.iloc[i_live]
-        # 簡單檢查上一根是否假突破
-        if c_m15['High'] > p_high and c_m15['Close'] < p_high and c_m15['Open'] < p_high:
-            live_status_msg = "🔥 **偵測到流動性清掃 (做空預備)！** 正在 M1 尋找精準跌破開盤價入場點..."
-        elif c_m15['Low'] < p_low and c_m15['Close'] > p_low and c_m15['Open'] > p_low:
-            live_status_msg = "🔥 **偵測到流動性清掃 (做多預備)！** 正在 M1 尋找精準突破開盤價入場點..."
+    if i_live > 20:
+        search_window = m15_data.iloc[i_live-20 : i_live-3]
+        if not search_window.empty:
+            p_high, p_low = search_window['High'].max(), search_window['Low'].min()
+            c_m15 = m15_data.iloc[i_live]
+            if c_m15['High'] > p_high and c_m15['Close'] < p_high and c_m15['Open'] < p_high:
+                live_status_msg = "🔥 **偵測到流動性清掃 (做空預備)！** 正在 M1 尋找精準跌破開盤價入場點..."
+            elif c_m15['Low'] < p_low and c_m15['Close'] > p_low and c_m15['Open'] > p_low:
+                live_status_msg = "🔥 **偵測到流動性清掃 (做多預備)！** 正在 M1 尋找精準突破開盤價入場點..."
 
 c1, c2, c3 = st.columns([1, 1, 2])
 c1.metric(f"{symbol_choice} 當前價格", f"{current_price:.4f}")
 c2.metric("最後更新時間 (台灣)", last_update_time)
 c3.info(live_status_msg)
 
-# 實盤近況圖表 (只顯示最近 60 根 M15)
 st.write("▼ 近期實盤走勢追蹤 (M15)")
 plot_live = m15_data.tail(60)
 fig_live = go.Figure(data=[go.Candlestick(x=plot_live.index, open=plot_live['Open'], high=plot_live['High'], low=plot_live['Low'], close=plot_live['Close'], name="15M K線", increasing_line_color='lightgray', decreasing_line_color='gray')])
