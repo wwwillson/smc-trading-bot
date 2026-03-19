@@ -2,58 +2,45 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
+import plotly.express as px
 import pytz
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 # 設定網頁標題與寬度
-st.set_page_config(page_title="5-Min Scalping Strategy", layout="wide")
+st.set_page_config(page_title="5-Min Scalping Backtest", layout="wide")
 
-st.title("📈 開盤 5 分鐘突破回踩剝頭皮策略 (5-Min Scalping)")
+st.title("📈 開盤 5 分鐘突破回踩策略 - 自動回測系統")
 
 # --- 側邊欄設定 ---
-st.sidebar.header("交易設定")
+st.sidebar.header("交易與回測設定")
 instrument = st.sidebar.selectbox(
-    "選擇交易品種",["BTC-USD (比特幣)", "GC=F (黃金期貨)", "EURUSD=X (歐元/美元)"]
+    "選擇交易品種",["BTC-USD (比特幣)", "GC=F (黃金期貨)", "EURUSD=X (歐元/美元)", "^GSPC (標普500)"]
 )
 
 # 對應 yfinance 的 Ticker
 ticker_map = {
     "BTC-USD (比特幣)": "BTC-USD",
     "GC=F (黃金期貨)": "GC=F",
-    "EURUSD=X (歐元/美元)": "EURUSD=X"
+    "EURUSD=X (歐元/美元)": "EURUSD=X",
+    "^GSPC (標普500)": "^GSPC"
 }
 ticker = ticker_map[instrument]
 
-# 選擇日期 (yfinance 5m 數據只能抓最近 60 天)
-selected_date = st.sidebar.date_input("選擇交易日期 (請選平日)", pd.Timestamp.today() - timedelta(days=1))
-
-# --- 顯示交易邏輯 ---
-with st.expander("📖 查看完整交易邏輯 (點擊展開)", expanded=True):
-    st.markdown("""
-    ### 策略步驟 (基於美東時間 EST)：
-    1. **標記前日流動性 (PDH & PDL)**：找出前一個交易日 9:30 AM - 4:00 PM 的最高點(PDH)與最低點(PDL)。這將是我們的止盈目標。
-    2. **標記開盤 5 分鐘區間**：標記當日 9:30 AM - 9:35 AM K線的最高點 (5M_H) 與最低點 (5M_L)。
-    3. **等待突破 (Breakout)**：價格必須明確突破 5M_H 或跌破 5M_L。
-    4. **等待回踩 (Retest) 並進場**：
-        * **做多**：突破 5M_H 後，價格回踩觸碰 5M_H 進場做多。
-        * **做空**：跌破 5M_L 後，價格回踩觸碰 5M_L 進場做空。
-    5. **設定止損止盈 (SL/TP)**：
-        * **做多**：止損設於 5M_L 下方，止盈目標為 PDH (需滿足至少 1:2 盈虧比)。
-        * **做空**：止損設於 5M_H 上方，止盈目標為 PDL (需滿足至少 1:2 盈虧比)。
-    """)
+st.sidebar.markdown("---")
+st.sidebar.markdown("⚠️ **注意：** 免費的 Yahoo Finance API 限制 `5分鐘K線` 最多只能下載 **最近 60 天** 的數據。")
+backtest_days = st.sidebar.slider("選擇回測天數", min_value=1, max_value=60, value=30)
+fixed_risk = st.sidebar.number_input("單筆交易固定風險 (美金)", min_value=10, max_value=1000, value=100)
+min_rr = st.sidebar.slider("最低進場盈虧比 (R/R Ratio)", min_value=1.0, max_value=3.0, value=1.5, step=0.1)
 
 # --- 獲取與處理數據 ---
 @st.cache_data(ttl=3600)
-def fetch_data(ticker, date):
-    # 抓取選定日期前幾天的數據以計算前日高低點
-    start_date = date - timedelta(days=3) # 往前抓確保有前一個交易日
-    end_date = date + timedelta(days=2)
-    
-    df = yf.download(ticker, start=start_date, end=end_date, interval="5m")
+def fetch_data(ticker, days):
+    # 下載數據 (往前多抓5天以確保第一天有前日高低點)
+    df = yf.download(ticker, period=f"{days + 5}d", interval="5m")
     if df.empty:
         return df
     
-    # 將索引轉換為美東時間 (EST)
+    # 轉換為美東時間 (EST)
     if df.index.tz is None:
         df.index = df.index.tz_localize('UTC')
     df.index = df.index.tz_convert('America/New_York')
@@ -64,133 +51,200 @@ def fetch_data(ticker, date):
         
     return df
 
-df = fetch_data(ticker, selected_date)
+with st.spinner('正在獲取歷史 5 分鐘數據並執行回測...'):
+    df = fetch_data(ticker, backtest_days)
 
 if df.empty:
-    st.error("無法獲取該日期的 5 分鐘數據，請選擇最近 60 天內的平日（不含週末）。")
-else:
-    # 定義時間範圍
-    target_day_str = selected_date.strftime('%Y-%m-%d')
+    st.error("無法獲取數據，請稍後再試。")
+    st.stop()
+
+# --- 執行回測邏輯 ---
+trades =[]
+unique_days = pd.Series(df.index.date).unique()
+
+for i in range(1, len(unique_days)):
+    prev_day_str = unique_days[i-1].strftime('%Y-%m-%d')
+    curr_day_str = unique_days[i].strftime('%Y-%m-%d')
     
-    # 找前一個交易日
-    available_days = pd.Series(df.index.date).unique()
-    available_days = [d for d in available_days if d < selected_date]
-    if not available_days:
-        st.warning("數據不足以計算前日高低點，請選擇更晚的日期。")
-        st.stop()
-    prev_day_str = available_days[-1].strftime('%Y-%m-%d')
-
-    # 1. 計算 PDH / PDL (前日 09:30 - 16:00)
+    # 1. 取得前日 PDH / PDL (09:30 - 16:00)
     prev_day_data = df.loc[f"{prev_day_str} 09:30":f"{prev_day_str} 16:00"]
-    if not prev_day_data.empty:
-        pdh = prev_day_data['High'].max()
-        pdl = prev_day_data['Low'].min()
-    else:
-        pdh, pdl = None, None
-
-    # 2. 計算 5M High / 5M Low (當日 09:30 - 09:35)
-    first_5m_data = df.loc[f"{target_day_str} 09:30":f"{target_day_str} 09:35"]
-    if not first_5m_data.empty:
-        m5_high = first_5m_data['High'].max()
-        m5_low = first_5m_data['Low'].min()
-    else:
-        m5_high, m5_low = None, None
-
-    # 3. 交易邏輯判斷 (當日 09:35 - 11:00)
-    trading_session = df.loc[f"{target_day_str} 09:35":f"{target_day_str} 11:00"]
+    if prev_day_data.empty: continue
+    pdh = float(prev_day_data['High'].max())
+    pdl = float(prev_day_data['Low'].min())
+    
+    # 2. 取得今日 5M High / 5M Low (09:30 - 09:35)
+    first_5m_data = df.loc[f"{curr_day_str} 09:30":f"{curr_day_str} 09:35"]
+    if first_5m_data.empty: continue
+    m5_high = float(first_5m_data['High'].max())
+    m5_low = float(first_5m_data['Low'].min())
+    
+    # 3. 進場掃描 (09:35 - 11:00)
+    trading_session = df.loc[f"{curr_day_str} 09:35":f"{curr_day_str} 11:00"]
     
     signal = None
-    entry_price = None
-    sl_price = None
-    tp_price = None
-    signal_time = None
-    
+    entry_price = 0
+    sl_price = 0
+    tp_price = 0
+    entry_time = None
     breakout_up = False
     breakout_down = False
-
-    if m5_high and m5_low and pdh and pdl and not trading_session.empty:
-        for idx, row in trading_session.iterrows():
-            # 判斷突破
-            if row['Close'] > m5_high:
-                breakout_up = True
-            elif row['Close'] < m5_low:
-                breakout_down = True
+    
+    for idx, row in trading_session.iterrows():
+        # 尋找突破
+        if row['Close'] > m5_high:
+            breakout_up = True
+        elif row['Close'] < m5_low:
+            breakout_down = True
             
-            # 判斷回踩並進場 (這裡做機械化簡化：突破後價格觸碰原本的 5M 高低點)
-            if breakout_up and signal is None:
-                if row['Low'] <= m5_high: # 回踩 5M_H
-                    signal = "LONG"
-                    entry_price = m5_high
-                    sl_price = m5_low # 簡化：止損放在 5M Low
-                    tp_price = pdh
-                    signal_time = idx
-                    break # 進場後停止掃描
-                    
-            elif breakout_down and signal is None:
-                if row['High'] >= m5_low: # 回踩 5M_L
-                    signal = "SHORT"
-                    entry_price = m5_low
-                    sl_price = m5_high # 簡化：止損放在 5M High
-                    tp_price = pdl
-                    signal_time = idx
+        # 尋找回踩並檢查盈虧比
+        if breakout_up and signal is None:
+            if row['Low'] <= m5_high:
+                risk = m5_high - m5_low
+                reward = pdh - m5_high
+                if risk > 0 and (reward / risk) >= min_rr:
+                    signal, entry_price, sl_price, tp_price, entry_time = "LONG", m5_high, m5_low, pdh, idx
+                    break
+        elif breakout_down and signal is None:
+            if row['High'] >= m5_low:
+                risk = m5_high - m5_low
+                reward = m5_low - pdl
+                if risk > 0 and (reward / risk) >= min_rr:
+                    signal, entry_price, sl_price, tp_price, entry_time = "SHORT", m5_low, m5_high, pdl, idx
                     break
 
-    # --- 繪製圖表 ---
-    st.subheader(f"📊 {instrument} - {selected_date} 走勢圖")
-    
-    # 只顯示當日的圖表 (09:00 - 12:00 讓畫面聚焦)
-    plot_df = df.loc[f"{target_day_str} 09:00":f"{target_day_str} 12:00"]
-    
-    if not plot_df.empty:
-        fig = go.Figure(data=[go.Candlestick(
-            x=plot_df.index,
-            open=plot_df['Open'], high=plot_df['High'],
-            low=plot_df['Low'], close=plot_df['Close'],
-            name="Candlesticks"
-        )])
-
-        # 畫水平線 (PDH, PDL, 5M_H, 5M_L)
-        if pdh: fig.add_hline(y=pdh, line_dash="dash", line_color="green", annotation_text="PDH (前日高點)")
-        if pdl: fig.add_hline(y=pdl, line_dash="dash", line_color="red", annotation_text="PDL (前日低點)")
-        if m5_high: fig.add_hline(y=m5_high, line_dash="solid", line_color="blue", annotation_text="9:30 5M High")
-        if m5_low: fig.add_hline(y=m5_low, line_dash="solid", line_color="orange", annotation_text="9:30 5M Low")
-
-        # 標示交易訊號
-        if signal:
-            st.success(f"🚨 **觸發交易訊號!** 方向: **{signal}** | 時間: {signal_time.strftime('%H:%M EST')}")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("進場價 (Entry)", f"{entry_price:.5f}")
-            col2.metric("止盈價 (TP)", f"{tp_price:.5f}")
-            col3.metric("止損價 (SL)", f"{sl_price:.5f}")
+    # 4. 出場掃描 (進場後 ~ 16:00 判斷打到 TP 或 SL)
+    if signal:
+        exit_session = df.loc[entry_time:f"{curr_day_str} 16:00"]
+        outcome = "未結算/平倉"
+        exit_time = exit_session.index[-1]
+        exit_price = float(exit_session.iloc[-1]['Close'])
+        pnl_usd = 0
+        
+        for e_idx, e_row in exit_session.iterrows():
+            if e_idx == entry_time: continue # 略過進場當下那一根K棒
             
-            # 在圖上加上箭頭標示
-            fig.add_annotation(
-                x=signal_time, y=entry_price,
-                text="⬆ LONG" if signal == "LONG" else "⬇ SHORT",
-                showarrow=True, arrowhead=1, arrowcolor="green" if signal=="LONG" else "red",
-                arrowsize=2, arrowwidth=2, ax=0, ay= 40 if signal=="LONG" else -40,
-                bgcolor="green" if signal=="LONG" else "red", font=dict(color="white")
-            )
-            
-            # 畫出止損與止盈區間區塊 (半透明)
-            fig.add_shape(type="rect",
-                x0=signal_time, y0=entry_price, x1=plot_df.index[-1], y1=tp_price,
-                fillcolor="LightGreen", opacity=0.3, line_width=0, layer="below"
-            )
-            fig.add_shape(type="rect",
-                x0=signal_time, y0=entry_price, x1=plot_df.index[-1], y1=sl_price,
-                fillcolor="LightPink", opacity=0.3, line_width=0, layer="below"
-            )
-        else:
-            st.info("🕒 今日 09:30 - 11:00 EST 期間無符合標準的突破回踩進場訊號。")
+            if signal == "LONG":
+                if e_row['Low'] <= sl_price:
+                    outcome, exit_price, exit_time = "🔴 止損 (Loss)", sl_price, e_idx
+                    break
+                elif e_row['High'] >= tp_price:
+                    outcome, exit_price, exit_time = "🟢 止盈 (Win)", tp_price, e_idx
+                    break
+            elif signal == "SHORT":
+                if e_row['High'] >= sl_price:
+                    outcome, exit_price, exit_time = "🔴 止損 (Loss)", sl_price, e_idx
+                    break
+                elif e_row['Low'] <= tp_price:
+                    outcome, exit_price, exit_time = "🟢 止盈 (Win)", tp_price, e_idx
+                    break
+        
+        # 計算盈虧
+        risk_dist = abs(entry_price - sl_price)
+        reward_dist = abs(tp_price - entry_price)
+        rr_ratio = reward_dist / risk_dist if risk_dist > 0 else 0
+        
+        if outcome == "🟢 止盈 (Win)":
+            pnl_usd = fixed_risk * rr_ratio
+        elif outcome == "🔴 止損 (Loss)":
+            pnl_usd = -fixed_risk
+        else: # 收盤未打到強制平倉
+            if signal == "LONG":
+                pnl_usd = fixed_risk * ((exit_price - entry_price) / risk_dist)
+            else:
+                pnl_usd = fixed_risk * ((entry_price - exit_price) / risk_dist)
 
-        # 更新圖表佈局
-        fig.update_layout(
-            height=600,
-            xaxis_rangeslider_visible=False,
-            template="plotly_dark",
-            margin=dict(l=20, r=20, t=20, b=20)
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("所選日期無當日開盤數據。")
+        trades.append({
+            "日期": curr_day_str,
+            "方向": signal,
+            "進場時間": entry_time.strftime('%H:%M'),
+            "出場時間": exit_time.strftime('%H:%M'),
+            "進場價": round(entry_price, 4),
+            "止盈 (TP)": round(tp_price, 4),
+            "止損 (SL)": round(sl_price, 4),
+            "預期盈虧比": round(rr_ratio, 2),
+            "結果": outcome,
+            "實際盈虧 ($)": round(pnl_usd, 2)
+        })
+
+# --- 轉換成 DataFrame 與顯示結果 ---
+st.markdown("### 📋 回測績效總覽")
+
+if len(trades) > 0:
+    trades_df = pd.DataFrame(trades)
+    
+    # 計算加總數據
+    total_trades = len(trades_df)
+    wins = len(trades_df[trades_df['結果'] == "🟢 止盈 (Win)"])
+    losses = len(trades_df[trades_df['結果'] == "🔴 止損 (Loss)"])
+    win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+    total_pnl = trades_df['實際盈虧 ($)'].sum()
+    
+    # 顯示總覽區塊
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("總交易次數", total_trades)
+    col2.metric("勝率", f"{win_rate:.1f} %")
+    col3.metric("總止盈 / 總止損", f"{wins} / {losses}")
+    col4.metric("💰 總淨利 (Total PnL)", f"$ {total_pnl:.2f}", 
+                delta_color="normal" if total_pnl > 0 else "inverse")
+
+    # 畫資金曲線 (Equity Curve)
+    st.markdown("#### 📈 資金成長曲線 (Cumulative PnL)")
+    trades_df['累計盈虧 ($)'] = trades_df['實際盈虧 ($)'].cumsum()
+    fig_equity = px.area(trades_df, x='日期', y='累計盈虧 ($)', 
+                         color_discrete_sequence=['#00FF00' if total_pnl > 0 else '#FF0000'])
+    st.plotly_chart(fig_equity, use_container_width=True)
+
+    # 顯示交易明細表
+    st.markdown("#### 📝 詳細交易紀錄表")
+    
+    def color_outcome(val):
+        color = 'lightgreen' if 'Win' in val else 'lightcoral' if 'Loss' in val else 'lightyellow'
+        return f'background-color: {color}; color: black;'
+    
+    st.dataframe(trades_df.style.applymap(color_outcome, subset=['結果']), use_container_width=True)
+
+    # --- 挑選單日看圖 ---
+    st.markdown("---")
+    st.markdown("### 🔍 單日走勢圖驗證 (點擊查看進場細節)")
+    selected_trade_day = st.selectbox("選擇要檢視圖表的交易日", trades_df['日期'].tolist())
+    
+    plot_df = df.loc[f"{selected_trade_day} 09:00":f"{selected_trade_day} 16:00"]
+    trade_info = trades_df[trades_df['日期'] == selected_trade_day].iloc[0]
+    
+    fig = go.Figure(data=[go.Candlestick(
+        x=plot_df.index,
+        open=plot_df['Open'], high=plot_df['High'],
+        low=plot_df['Low'], close=plot_df['Close'],
+        name="Candlesticks"
+    )])
+
+    # 加入輔助線
+    fig.add_hline(y=trade_info['止盈 (TP)'], line_dash="dash", line_color="green", annotation_text="TP (止盈目標)")
+    fig.add_hline(y=trade_info['止損 (SL)'], line_dash="dash", line_color="red", annotation_text="SL (止損保護)")
+    fig.add_hline(y=trade_info['進場價'], line_dash="solid", line_color="blue", annotation_text="Entry (進場點)")
+
+    # 標示進場點箭頭與框
+    entry_datetime = pd.to_datetime(f"{selected_trade_day} {trade_info['進場時間']}").tz_localize('America/New_York')
+    fig.add_annotation(
+        x=entry_datetime, y=trade_info['進場價'],
+        text="⬆ LONG" if trade_info['方向'] == "LONG" else "⬇ SHORT",
+        showarrow=True, arrowhead=1, arrowcolor="blue",
+        arrowsize=2, arrowwidth=2, ax=0, ay= 40 if trade_info['方向']=="LONG" else -40,
+        bgcolor="blue", font=dict(color="white")
+    )
+    
+    # 止盈止損顏色區塊
+    fig.add_shape(type="rect",
+        x0=entry_datetime, y0=trade_info['進場價'], x1=plot_df.index[-1], y1=trade_info['止盈 (TP)'],
+        fillcolor="LightGreen", opacity=0.3, line_width=0, layer="below"
+    )
+    fig.add_shape(type="rect",
+        x0=entry_datetime, y0=trade_info['進場價'], x1=plot_df.index[-1], y1=trade_info['止損 (SL)'],
+        fillcolor="LightPink", opacity=0.3, line_width=0, layer="below"
+    )
+
+    fig.update_layout(height=600, xaxis_rangeslider_visible=False, template="plotly_dark")
+    st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.warning(f"在過去的 {backtest_days} 天內，找不到符合（突破、回踩且盈虧比大於 {min_rr}）的交易機會。可以嘗試調低最低盈虧比，或增加回測天數。")
